@@ -21,7 +21,7 @@ class IntermidateEmbedding():
     def __init__(self, embedding_dim, nheads, C=32):
         self.embedding_dim = embedding_dim
         
-        self.C = C
+        self.C = C#// nheads
         self.nheads = nheads
         self.maddness_qk = None
         self.maddness_wv = None
@@ -32,19 +32,10 @@ class IntermidateEmbedding():
     def reset_state(self):
         self.trained_p = False
         self.maddness_qk = [MaddnessMatmul(C=self.C) for _ in range(self.nheads)]
-        self.maddness_wv = [MaddnessMatmul(C=self.C) for _ in range(self.nheads)]
-
-    def set_target(self):
-        # Construct LUT
-        # Training from:
-        # SourceとTargetをよく分類するMaddness Binary_hashing_tree
-        # nsplits=4で固定、 Positional Encodnigを明示的に与えて、Bucketに加算 (Embedding(vocab_size * relative_position_candidates* ...))
-        pass
+        #self.maddness_wv = [MaddnessMatmul(C=self.C) for _ in range(self.nheads)]
 
     def train_maddness_qk(self, q, k, verbose=True):
-        # Embeddingからランダムにサンプルを持ってきて, それとTarget間のLUTを構築
-        # Source -> Fixed
-        # Traget -> Dynamic
+        # TODO: Embeddingからランダムにサンプルを持ってきて, それとTarget間のLUTを構築
 
         # Memo
         # MHA: [Linear[k].weight = torch.concat([source[:, 0], source[:, 1], ...])] where k = 0...len(target)
@@ -119,9 +110,7 @@ class MProj():
         self.embedding_dim = embedding_dim
         self.proj = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
-        prototype_length = embedding_dim/C
-        self.C = embedding_dim / prototype_length
-        self.C = 32 # C=64, 128, 256... TODO: Setting this parameter.
+        self.C = C # TODO: Test C=32, 64, ...
         self.maddness = None
         self.reset_state()
 
@@ -213,9 +202,9 @@ class CachingMHA():
             self.maddness_qkv_proj_trained_p,
             [self.q_proj, self.k_proj, self.v_proj],
             source,
-            approx=approx)
+            approx=False)
         
-        q, k1, v = self.q_proj(source, approx=approx), self.k_proj(target, approx=approx), self.v_proj(target, approx=approx)
+        q, k1, v = self.q_proj(source, approx=False), self.k_proj(target, approx=False), self.v_proj(target, approx=False)
         q, k, v  = self.split_heads(q), self.split_heads(k1, k=True, approx=approx), self.split_heads(v)
 
         if approx:
@@ -225,7 +214,7 @@ class CachingMHA():
 
         o = self.merge_heads(o)
 
-        if not self.maddness_out_proj_trained_p and approx:
+        if not self.maddness_out_proj_trained_p and False:#approx:
             # Note: when to call train_g?
             # 文章生成の最後らへんに学習をしたい？
             self.maddness_out_proj_trained_p = True
@@ -233,6 +222,6 @@ class CachingMHA():
             o_not_masked = self.merge_heads(o_not_masked)
             self.out_proj.set_A_offline(o_not_masked.reshape((-1, o_not_masked.size()[-1])).to('cpu').detach().numpy())
         
-        o = self.out_proj(o, approx=approx) # Fix approx=False?
+        o = self.out_proj(o, approx=False) # Fix approx=False?
         return o
     

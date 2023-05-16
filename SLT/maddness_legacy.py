@@ -3,11 +3,16 @@
 
 import copy
 import numba
+from numba import prange
 import numpy as np
 
 from sklearn import linear_model
 import os, resource
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union, Literal, TYPE_CHECKING
+from .cffi_utils import (
+    maddness_encode_cpp,
+    maddness_scan
+    )
 
 @numba.njit(fastmath=True, cache=True, parallel=False)
 def _cumsse_cols(X):
@@ -769,7 +774,6 @@ def maddness_encode(
         A_enc[:, c] = apply_hash_function(X, multisplits_lists[c])
     return np.ascontiguousarray(A_enc)
 
-
 # @_memory.cache
 def learn_proto_and_hash_function(
     X: np.ndarray, C: int, lut_work_const: int = -1
@@ -863,8 +867,117 @@ def maddness_quantize_luts(luts: np.ndarray, force_power_of_2: bool = True) -> A
 
     return luts_quantized, offsets.sum(), scale
 
+#Ref: https://github.com/joennlae/halutmatmul/blob/master/src/python/halutmatmul/functions.py
+@numba.jit(nopython=True, parallel=False)
+def apply_hash_function_opt(X: np.ndarray, splits: np.ndarray) -> np.ndarray:
+    N, _ = X.shape
+    # original code had a distinction: not sure why
+    group_ids = np.zeros(N, dtype=np.int64)  # needs to be int64 because of index :-)
+    num_splits = splits.shape[0]
+    length = splits.shape[1] - 3
+    for i in range(num_splits):
+        vals = splits[i, 0 : pow(2, i)]
+        vals = vals[group_ids]
+        dim = int(splits[i, length])
+        scaleby = splits[i, length + 1]
+        offset = splits[i, length + 2]
+        x = X[:, dim] - offset
+        x = x * scaleby
+        indicators = x > vals
+        group_ids = (group_ids * 2) + indicators
+    return group_ids
 
-# pylint: disable=R0902
+#Ref: https://github.com/joennlae/halutmatmul/blob/master/src/python/halutmatmul/functions.py
+@numba.jit(nopython=True, parallel=True)
+def halut_encode_opt(X: np.ndarray, numpy_array: np.ndarray) -> np.ndarray:
+    N, _ = X.shape
+    C = numpy_array.shape[0]
+    A_enc = np.empty((C, N), dtype=np.int32)  # column-major
+    # split_lists = numpy_to_split_list(numpy_array)
+    for c in prange(C):
+        A_enc[c] = apply_hash_function_opt(X, numpy_array[c])
+    return np.ascontiguousarray(A_enc.T)
+
+#Ref: https://github.com/joennlae/halutmatmul/blob/master/src/python/halutmatmul/functions.py
+def split_lists_to_numpy(
+    buckets: list[list[MultiSplit]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    length = 0
+    for c in buckets:
+        for v in c:
+            length = v.vals.shape[0] if v.vals.shape[0] > length else length
+    i = k = 0
+    ret_array = np.zeros((len(buckets), len(buckets[0]), length + 3), dtype=np.float32)
+    
+    thresholds = []
+    dims = []
+    
+    # very ugly but I inherited that structure from the original code
+    # which can be found here:
+    # https://github.com/dblalock/bolt
+    for c in buckets:
+        k = 0
+        for v in c:
+            ret_array[i, k, 0 : pow(2, k)] = v.vals
+            for t in v.vals:
+                thresholds.append(t)
+            ret_array[i, k, length] = v.dim
+            dims.append(v.dim)
+            ret_array[i, k, length + 1] = v.scaleby
+            ret_array[i, k, length + 2] = v.offset
+            k += 1
+        i += 1
+    return ret_array, np.array(thresholds, dtype=np.float32), np.array(dims)
+
+@numba.jit(parallel=True, nopython=True)
+def read_luts_opt(
+    A_raveled: np.ndarray,
+    A_shape: tuple[int, int],
+    B_luts: np.ndarray,
+    total_result: np.ndarray,
+) -> np.ndarray:
+    for i in prange((len(B_luts))):
+        read_lut = B_luts[i].ravel()[A_raveled].reshape(A_shape)
+        read_lut = read_lut.sum(axis=-1)
+        total_result[i] = read_lut
+    return total_result
+
+@numba.jit(parallel=True, nopython=True)
+def read_luts_quantized_opt(
+    A_raveled: np.ndarray,
+    A_shape: tuple[int, int],
+    B_luts: np.ndarray,
+    total_result: np.ndarray,
+    upcast_every: int,
+    C: int,
+    scale: float,
+    offset: float,
+) -> np.ndarray:
+    for i in prange((len(B_luts))):
+        lut = B_luts[i]
+        read_lut_1 = lut.ravel()[A_raveled].reshape(A_shape)
+        shape_new = (
+            read_lut_1.shape[0],
+            int(A_shape[0] * A_shape[1] / upcast_every / read_lut_1.shape[0]),
+            upcast_every,
+        )
+        read_lut = read_lut_1.reshape(shape_new)
+
+        # while read_lut.shape[-1] > 2:
+        for _ in range(np.log2(read_lut.shape[-1]) - 1):
+            read_lut = (read_lut[:, :, ::2] + read_lut[:, :, 1::2] + 1) // 2
+
+        read_lut = (read_lut[:, :, 0] + read_lut[:, :, 1] + 1) // 2
+        read_lut = read_lut.sum(axis=-1)  # clipping not needed
+        read_lut *= upcast_every  # convert mean to sum
+
+        bias = C / 4 * np.log2(upcast_every)
+        read_lut -= int(bias)
+
+        read_lut = (read_lut / scale) + offset
+        total_result[i] = read_lut
+    return total_result
+
 class MaddnessMatmul:
     def __init__(self, C: int = 16, lut_work_const: int = -1) -> None:
         # checks
@@ -892,8 +1005,11 @@ class MaddnessMatmul:
             A, self.C, lut_work_const=self.lut_work_const
         )
 
+        self.ret_array, _, _ = split_lists_to_numpy(self.splits_lists)
+
     def _encode_A(self, A: np.ndarray) -> np.ndarray:
-        idxs = maddness_encode(A, self.splits_lists)
+        #idxs = maddness_encode(A, self.splits_lists)
+        idxs = halut_encode_opt(A, self.ret_array)
         # offsets = [  0  16  32  48  64  80  96 112 128 144 160 176 192 208 224 240]
         offsets = np.arange(self.C, dtype=np.int32) * self.K
         return idxs + offsets
@@ -908,7 +1024,6 @@ class MaddnessMatmul:
             return luts, offset, scale
         return luts, 0, 1
 
-    @numba.jit(forceobj=True)
     def _calc_matmul(
         self,
         A_enc: np.ndarray,
@@ -916,51 +1031,15 @@ class MaddnessMatmul:
         offset: float,
         scale: float,
     ) -> np.ndarray:
-        A_enc = np.ascontiguousarray(A_enc)
+        #A = np.ascontiguousarray(A_enc).ravel()
+        #total_result = np.empty((len(B_luts), len(A_enc)), dtype=np.float32)
+        #read_luts_quantized_opt(A, A_enc.shape, B_luts, total_result, self.upcast_every, self.C, self.scale, self.offset)
 
-        total_result = np.empty((len(B_luts), len(A_enc)), dtype=np.float32)
-        for i, lut in enumerate(B_luts):
-            read_lut = lut.ravel()[A_enc.ravel()].reshape(A_enc.shape)
-            if self.upcast_every < 2 or not self.quantize_lut:
-                read_lut = read_lut.sum(axis=-1)
-            else:
-                # TODO: there is probably room for improvement here
-                read_lut = read_lut.reshape(read_lut.shape[0], -1, self.upcast_every)
-                if self.accumulate_how == "sum":
-                    # sum upcast_every vals, then clip to mirror saturating
-                    # unsigned addition, then sum without saturation (like u16)
-                    read_lut = read_lut.sum(2)
-                    read_lut = np.clip(read_lut, 0, 255).sum(axis=-1)
-                elif self.accumulate_how == "mean":
-                    # mirror hierarchical avg_epu8
-
-                    while read_lut.shape[-1] > 2:
-                        read_lut = (read_lut[:, :, ::2] + read_lut[:, :, 1::2] + 1) // 2
-
-                    read_lut = (read_lut[:, :, 0] + read_lut[:, :, 1] + 1) // 2
-                    read_lut = read_lut.sum(axis=-1)  # clipping not needed
-
-                    # undo biasing; if low bits are {0,0} or {1,1}, no bias
-                    # from the averaging; but if {0,1}, then rounds up by
-                    # .5; happens with prob ~=~ .5, so each avg op adds .25;
-                    # the other tricky thing here is that rounding up when
-                    # you're averaging averages biases it even farther
-                    read_lut *= self.upcast_every  # convert mean to sum
-
-                    # I honestly don't know why this is the formula, but wow
-                    # does it work well
-                    bias = self.C / 4 * np.log2(self.upcast_every)
-                    read_lut -= int(bias)
-
-                else:
-                    raise ValueError("accumulate_how must be 'sum' or 'mean'")
-
-            if self.quantize_lut:
-                read_lut = (read_lut / scale) + offset
-            total_result[i] = read_lut
-
-        return total_result.T
-
+        #return total_result.T
+        #upcast_every = 16
+        out =  maddness_scan(A_enc, self.C, self.luts.shape[0], self.luts)
+        return out.astype(np.float32)
+        
     def _set_A(self, A: np.ndarray) -> None:
         self.A_enc = self._encode_A(A)
 
