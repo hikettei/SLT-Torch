@@ -764,7 +764,6 @@ def maddness_encode(
 ) -> np.ndarray:
     N, _ = X.shape
     C = len(multisplits_lists)
-    print(f"C:{C}")
     A_enc = np.empty((N, C), dtype=np.int32, order="F")  # column-major
     for c in range(C):
         A_enc[:, c] = apply_hash_function(X, multisplits_lists[c])

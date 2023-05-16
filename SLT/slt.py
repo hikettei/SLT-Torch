@@ -52,7 +52,13 @@ class MProj():
 
     def __call__(self, x, approx=False):
         if approx:
-            return x
+            # Excepted: batch_size = 1 (TODO: Remove this constraints)
+            self.maddness._set_A(x.reshape(-1, x.size(-1)).to('cpu').detach().numpy())
+            return torch.from_numpy(self.maddness._calc_matmul(
+                self.maddness.A_enc,
+                self.maddness.luts,
+                self.maddness.offset,
+                self.maddness.scale)).reshape(x.size())
         else:
             return self.proj(x)
 
@@ -101,6 +107,8 @@ class CachingMHA():
     def reset_state(self):
         self.maddness_qkv_proj_trained_p = False
         [layer.reset_state() for layer in [self.q_proj, self.k_proj, self.v_proj]]
+        self.maddness_out_proj_trained_p = False
+        self.out_proj.reset_state()
         
     def merge_heads(self, x):
         x = x.permute(0, 2, 1, 3).contiguous()
@@ -139,6 +147,14 @@ class CachingMHA():
             o = self._scal_dot_attn(q, k, v, mask=mask)
 
         o = self.merge_heads(o)
+
+        if not self.maddness_out_proj_trained_p and approx:
+            # Note: when to call train_g?
+            self.maddness_out_proj_trained_p = True
+            o_not_masked = self._scal_dot_attn(q, k, v, mask=None)
+            o_not_masked = self.merge_heads(o_not_masked)
+            self.out_proj.set_A_offline(o_not_masked.reshape((-1, o_not_masked.size()[-1])).to('cpu').detach().numpy())
+        
         o = self.out_proj(o, approx=approx)
         return o
     
