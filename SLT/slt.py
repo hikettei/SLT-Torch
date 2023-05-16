@@ -14,6 +14,8 @@ from .maddness_legacy import (
 import time
 from tqdm import tqdm
 
+import numba
+
 # 文章長が変わったらReset?
 
 #Linear, matmul*2
@@ -28,6 +30,8 @@ class IntermidateEmbedding():
         self.trained_p   = False
         
         self.reset_state()
+
+        self.apply_qk_out = None
         
     def reset_state(self):
         self.trained_p = False
@@ -63,8 +67,12 @@ class IntermidateEmbedding():
         # k ... target
         # in this case, we ignore q but use prototypes instead.
 
-        apply_qk_out = torch.zeros((1, q.size(1), q.size(-2), k.size(-2)), dtype=torch.float32)
+        # Caching
+        if self.apply_qk_out is None or self.apply_qk_out.size() != (1, q.size(1), q.size(-2), k.size(-2)):
+            self.apply_qk_out = torch.zeros((1, q.size(1), q.size(-2), k.size(-2)), dtype=torch.float32)
 
+        apply_qk_out = self.apply_qk_out
+        
         for nth_head, maddness in enumerate(self.maddness_qk):
             k_enc = k[:, nth_head, :, :].reshape((-1, q.size(-1))).to('cpu').detach().numpy()
             maddness._set_A(k_enc)
@@ -165,7 +173,6 @@ class CachingMHA():
         attn_w = nn.Softmax(dim=-1)(attn_w)
 
         res = torch.matmul(attn_w, v)
-
         return res
 
     def reset_state(self):
@@ -216,7 +223,6 @@ class CachingMHA():
 
         if not self.maddness_out_proj_trained_p and False:#approx:
             # Note: when to call train_g?
-            # 文章生成の最後らへんに学習をしたい？
             self.maddness_out_proj_trained_p = True
             o_not_masked = self._scal_dot_attn(q, self.split_heads(k1, k=True, approx=False), v, mask=None)
             o_not_masked = self.merge_heads(o_not_masked)

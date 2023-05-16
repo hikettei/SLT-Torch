@@ -990,7 +990,7 @@ class MaddnessMatmul:
         self.A_enc: Optional[np.ndarray] = None
         self.luts: Optional[np.ndarray] = None
 
-        self.quantize_lut = False
+        self.quantize_lut = True
         self.upcast_every = 16
         self.upcast_every = min(self.C, self.upcast_every)
         # important otherwise wrong summation
@@ -1037,8 +1037,10 @@ class MaddnessMatmul:
 
         #return total_result.T
         #upcast_every = 16
-        out =  maddness_scan(A_enc, self.C, self.luts.shape[0], self.luts)
-        return out.astype(np.float32)
+        out =  maddness_scan(A_enc, self.C, self.luts.shape[0], self.luts).astype(np.float32)
+        out = (out + self.offset) / self.scale
+        #TODO: ADD BIAS
+        return out
         
     def _set_A(self, A: np.ndarray) -> None:
         self.A_enc = self._encode_A(A)
