@@ -1,4 +1,6 @@
 
+#Ref: https://github.com/joennlae/halutmatmul
+
 import copy
 import numba
 import numpy as np
@@ -84,8 +86,6 @@ class Bucket:
 
         self.N = len(point_ids)
         self.id = bucket_id
-        if self.N == 0:
-            print("created empty bucket: ", self.id)
         # this is just so that we can store the point ids as array instead of
         # set, while still retaining option to run our old code that needs
         # them to be a set for efficient inserts and deletes
@@ -283,7 +283,7 @@ def learn_binary_tree_splits(
     # total_loss = sum([bucket.loss for bucket in buckets])
 
     # print("================================")
-    # print("learn_binary_tree_splits(): initial loss:   ", total_loss)
+    # print("learn_binary_tree_splits(): initial loss:  ", total_loss)
 
     splits = []
     col_losses = np.zeros(D, dtype=np.float32)
@@ -394,7 +394,6 @@ def init_and_learn_hash_function(
         multisplits, _, buckets = learn_binary_tree_splits(
             use_X_error, X_orig=use_X_orig, return_prototypes=False
         )
-        print(_)
 
         for split in multisplits:
             split.dim = idxs[split.dim]
@@ -424,7 +423,6 @@ def init_and_learn_hash_function(
             f"Learning progress {X.shape}-{C}-{K}: {c + 1}/{C} "
             f"({(ram_usage / (1024 * 1024)):.3f} GB)"
         )
-    print(all_prototypes)
     return X_error, all_splits, all_prototypes, all_buckets
 
 
@@ -461,14 +459,13 @@ def _fit_ridge_enc(A_enc=None, Y=None, K=16, lamda=1, X_binary=None):
     """
     if X_binary is None:
         X_binary = sparsify_and_int8_A_enc(A_enc, K=K)
-    print(X_binary.shape, Y.shape)
     # X_binary_sparse = csr_matrix(X_binary) # will change solver from cholesky to sparse_cg
     est = linear_model.Ridge(
         fit_intercept=False, alpha=lamda, solver="auto", copy_X=False
     )
     est.fit(X_binary, Y)
     w = est.coef_.T
-    print(est.get_params())
+
     return w
 
 
@@ -839,7 +836,6 @@ def learn_proto_and_hash_function(
             ram_usage / (1024 * 1024),
         ]
     )
-    print(all_prototypes)
     return all_splits, all_prototypes, report_array
 
 def maddness_lut(q: np.ndarray, all_prototypes: np.ndarray) -> np.ndarray:
@@ -900,7 +896,6 @@ class MaddnessMatmul:
     def _encode_A(self, A: np.ndarray) -> np.ndarray:
         idxs = maddness_encode(A, self.splits_lists)
         # offsets = [  0  16  32  48  64  80  96 112 128 144 160 176 192 208 224 240]
-        print(idxs)
         offsets = np.arange(self.C, dtype=np.int32) * self.K
         return idxs + offsets
 
