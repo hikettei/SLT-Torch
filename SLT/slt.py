@@ -14,20 +14,25 @@ from .maddness_legacy import (
 import time
 from tqdm import tqdm
 
+# 文章長が変わったらReset?
+
 #Linear, matmul*2
 class IntermidateEmbedding():
-    def __init__(self, embedding_dim, nheads, C=7):
+    def __init__(self, embedding_dim, nheads, C=32):
         self.embedding_dim = embedding_dim
         
-        prototype_length = embedding_dim/nheads/C
-        self.C = embedding_dim / prototype_length
-        self.maddness = None
+        self.C = C
+        self.nheads = nheads
+        self.maddness_qk = None
+        self.maddness_wv = None
+        self.trained_p   = False
+        
         self.reset_state()
-        self.lock = False
         
     def reset_state(self):
-        self.lock = False
-        self.maddness = MaddnessMatmul(C=self.C)
+        self.trained_p = False
+        self.maddness_qk = [MaddnessMatmul(C=self.C) for _ in range(self.nheads)]
+        self.maddness_wv = [MaddnessMatmul(C=self.C) for _ in range(self.nheads)]
 
     def set_target(self):
         # Construct LUT
@@ -36,17 +41,87 @@ class IntermidateEmbedding():
         # nsplits=4で固定、 Positional Encodnigを明示的に与えて、Bucketに加算 (Embedding(vocab_size * relative_position_candidates* ...))
         pass
 
-    def apply_matmul(self, source):
-        pass
+    def train_maddness_qk(self, q, k, verbose=True):
+        # Embeddingからランダムにサンプルを持ってきて, それとTarget間のLUTを構築
+        # Source -> Fixed
+        # Traget -> Dynamic
+
+        # Memo
+        # MHA: [Linear[k].weight = torch.concat([source[:, 0], source[:, 1], ...])] where k = 0...len(target)
+        
+        for nth_head, maddness in enumerate(self.maddness_qk):
+            # Source-target attention as self-attention.
+            q_offline = q[:, nth_head, :, :].reshape((-1, q.size(-1))).to('cpu').detach().numpy() # Corresponds to source
+
+            # Encoding_Time < Total_Timeを満たす条件の中の頻度で, binary-treeを再学習, prototypeを再度構築
+            maddness._learn_hash_buckets_and_prototypes(q_offline)
+            maddness._set_B(q_offline.T)
+
+            # Measure Accuracy
+            if verbose:
+                # QとKは全く別のweightから得られたものでは？
+                # Wを無視するためのLSH
+                k_offline = q[:, nth_head, :, :].reshape((-1, k.size(-1))).to('cpu').detach().numpy() # Corresponds to target
+                # TODO...
+
+    def train_maddness_wv(self, w, v):
+        pass # TODO (w, v is not constant)
+
+    def apply_qk_mm(self, q, k):
+        # q ... source
+        # k ... target
+        # in this case, we ignore q but use prototypes instead.
+
+        apply_qk_out = torch.zeros((1, q.size(1), q.size(-2), k.size(-2)), dtype=torch.float32)
+
+        for nth_head, maddness in enumerate(self.maddness_qk):
+            k_enc = k[:, nth_head, :, :].reshape((-1, q.size(-1))).to('cpu').detach().numpy()
+            maddness._set_A(k_enc)
+            apply_qk_out[:, nth_head, :, :] = torch.from_numpy(
+                maddness._calc_matmul(
+                    maddness.A_enc,
+                    maddness.luts,
+                    maddness.offset,
+                    maddness.scale).T)
+        return apply_qk_out
+
+    
+    def apply_wv_mm(self, w, v):
+        return torch.matmul(w, v) # TODO 
+        
+    
+    def scal_dot_attn(self, q, k, v, mask=None):
+        #q.size() = [1, nheads, sentence_length, embedding_dim/nheads]
+        # [1, 8, 100, 98]
+
+        if not self.trained_p:
+            self.train_maddness_qk(q, k)
+        w = self.apply_qk_mm(q, k)
+
+        if mask is not None:
+            w = w.data.masked_fill_(mask, -torch.finfo(torch.float).max)
+            
+        w = w / w.size(-1)
+        w = nn.Softmax(dim=-1)(w)
+
+        if not self.trained_p:
+            self.train_maddness_wv(w, v)
+            
+        res = self.apply_wv_mm(w, v)
+
+        if not self.trained_p:
+            self.trained_p = True
+            
+        return res
 
 class MProj():
-    def __init__(self, embedding_dim, C=7):
+    def __init__(self, embedding_dim, C=32):
         self.embedding_dim = embedding_dim
         self.proj = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
         prototype_length = embedding_dim/C
         self.C = embedding_dim / prototype_length
-        self.C = 16
+        self.C = 32 # C=64, 128, 256... TODO: Setting this parameter.
         self.maddness = None
         self.reset_state()
 
@@ -75,7 +150,7 @@ class MProj():
 #Ref: https://github.com/graykode/gpt-2-Pytorch/blob/master/GPT2/model.py
 
 class CachingMHA():
-    def __init__(self, embedding_dim, maxlen, nheads, C=7):
+    def __init__(self, embedding_dim, maxlen, nheads, C=32):
         self.intermidate = IntermidateEmbedding(embedding_dim, nheads, C=C)
         self.maxlen = maxlen
         
@@ -115,10 +190,10 @@ class CachingMHA():
         new_x_shape = x.size()[:-2] + (x.size(-2) * x.size(-1),)
         return x.view(*new_x_shape)  # in Tensorflow implem: fct merge_states
     
-    def split_heads(self, x, k=False):
+    def split_heads(self, x, k=False, approx=False):
         new_x_shape = x.size()[:-1] + (self.n_head, x.size(-1) // self.n_head)
         x = x.view(*new_x_shape)  # in Tensorflow implem: fct split_states
-        if k:
+        if k and not approx:
             return x.permute(0, 2, 3, 1)  # (batch, head, head_features, seq_length)
         else:
             return x.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
@@ -133,16 +208,18 @@ class CachingMHA():
         return cond
         
     def forward(self, source, target, mask, approx=False):
+        assert source.size(0) == 1 and target.size(0) == 1, "CachingMHA: Set Batch_Size = 1"
         self.maddness_qkv_proj_trained_p = self.train_g(
             self.maddness_qkv_proj_trained_p,
             [self.q_proj, self.k_proj, self.v_proj],
-            target,
+            source,
             approx=approx)
-        q, k, v = self.q_proj(source, approx=approx), self.k_proj(target, approx=approx), self.v_proj(target, approx=approx)
-        q, k, v = self.split_heads(q), self.split_heads(k, k=True), self.split_heads(v)
+        
+        q, k1, v = self.q_proj(source, approx=approx), self.k_proj(target, approx=approx), self.v_proj(target, approx=approx)
+        q, k, v  = self.split_heads(q), self.split_heads(k1, k=True, approx=approx), self.split_heads(v)
 
         if approx:
-            o = v
+            o = self.intermidate.scal_dot_attn(q, k, v, mask=mask)
         else:
             o = self._scal_dot_attn(q, k, v, mask=mask)
 
@@ -150,11 +227,12 @@ class CachingMHA():
 
         if not self.maddness_out_proj_trained_p and approx:
             # Note: when to call train_g?
+            # 文章生成の最後らへんに学習をしたい？
             self.maddness_out_proj_trained_p = True
-            o_not_masked = self._scal_dot_attn(q, k, v, mask=None)
+            o_not_masked = self._scal_dot_attn(q, self.split_heads(k1, k=True, approx=False), v, mask=None)
             o_not_masked = self.merge_heads(o_not_masked)
             self.out_proj.set_A_offline(o_not_masked.reshape((-1, o_not_masked.size()[-1])).to('cpu').detach().numpy())
         
-        o = self.out_proj(o, approx=approx)
+        o = self.out_proj(o, approx=approx) # Fix approx=False?
         return o
     
