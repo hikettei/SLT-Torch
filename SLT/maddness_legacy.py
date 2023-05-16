@@ -1038,9 +1038,10 @@ class MaddnessMatmul:
         #return total_result.T
         #upcast_every = 16
         out =  maddness_scan(A_enc, self.C, self.luts.shape[0], self.luts).astype(np.float32)
-        out = (out + self.offset) / self.scale
+        #out = (out + self.offset) / self.scale
+        # 
         #TODO: ADD BIAS
-        return out
+        return out #->softmax
         
     def _set_A(self, A: np.ndarray) -> None:
         self.A_enc = self._encode_A(A)
