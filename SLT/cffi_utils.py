@@ -53,7 +53,7 @@ def convert_to_cpp_float(arr):
     return ffi.cast("float*", arr.ctypes.data)
 
 # ncodebooks=16
-def maddness_encode_cpp(X, STEP, C, nsplits, splitdims, splitvals, scales, offsets, add_offsets=False):
+def maddness_encode_cpp(X, STEP, C, nsplits, splitdims, splitvals, scales, offsets):
     K = 2**nsplits
     out = np.zeros((X.shape[0], STEP), dtype=np.uint8, order="F")
     LIBMITHRAL_STATIC.maddness_encode(convert_to_cpp_float(X), 

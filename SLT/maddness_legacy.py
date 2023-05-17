@@ -1030,6 +1030,7 @@ class MaddnessMatmul:
         B_luts: np.ndarray,
         offset: float,
         scale: float,
+            M=None
     ) -> np.ndarray:
         #A = np.ascontiguousarray(A_enc).ravel()
         #total_result = np.empty((len(B_luts), len(A_enc)), dtype=np.float32)
@@ -1037,8 +1038,10 @@ class MaddnessMatmul:
 
         #return total_result.T
         #upcast_every = 16
-        out =  maddness_scan(A_enc, self.C, self.luts.shape[0], self.luts).astype(np.float32)
-        #out = (out + self.offset) / self.scale
+        if M is None:
+            M = self.luts.shape[0]
+        out =  maddness_scan(A_enc, self.C, M, self.luts).astype(np.float32)
+        out = (out + offset) / scale
         # 
         #TODO: ADD BIAS
         return out #->softmax

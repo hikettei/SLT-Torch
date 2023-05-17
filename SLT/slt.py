@@ -47,16 +47,18 @@ class IntermidateEmbedding():
         for nth_head, maddness in enumerate(self.maddness_qk):
             # Source-target attention as self-attention.
             q_offline = q[:, nth_head, :, :].reshape((-1, q.size(-1))).to('cpu').detach().numpy() # Corresponds to source
+            k_offline = k[:, nth_head, :, :].reshape((-1, k.size(-1))).to('cpu').detach().numpy() # Corresponds to target
 
             # Encoding_Time < Total_Timeを満たす条件の中の頻度で, binary-treeを再学習, prototypeを再度構築
-            maddness._learn_hash_buckets_and_prototypes(q_offline)
+            maddness._learn_hash_buckets_and_prototypes(k_offline)
             maddness._set_B(q_offline.T)
 
             # Measure Accuracy
             if verbose:
+                pass
                 # QとKは全く別のweightから得られたものでは？
                 # Wを無視するためのLSH
-                k_offline = q[:, nth_head, :, :].reshape((-1, k.size(-1))).to('cpu').detach().numpy() # Corresponds to target
+                
                 # TODO...
 
     def train_maddness_wv(self, w, v):
@@ -68,26 +70,25 @@ class IntermidateEmbedding():
         # in this case, we ignore q but use prototypes instead.
 
         # Caching
-        if self.apply_qk_out is None or self.apply_qk_out.size() != (1, q.size(1), q.size(-2), k.size(-2)):
-            self.apply_qk_out = torch.zeros((1, q.size(1), q.size(-2), k.size(-2)), dtype=torch.float32)
-
-        apply_qk_out = self.apply_qk_out
-        
+        apply_qk_out = torch.zeros((1, q.size(1), q.size(-2), k.size(-2)), dtype=torch.float32)
         for nth_head, maddness in enumerate(self.maddness_qk):
-            k_enc = k[:, nth_head, :, :].reshape((-1, q.size(-1))).to('cpu').detach().numpy()
+            k_enc = k[:, nth_head, :, :].reshape((-1, k.size(-1))).to('cpu').detach().numpy()
+            q_enc = k[:, nth_head, :, :].reshape((-1, k.size(-1))).to('cpu').detach().numpy()
             maddness._set_A(k_enc)
-            apply_qk_out[:, nth_head, :, :] = torch.from_numpy(
+            #maddness._set_B(q_enc.T)
+            res = torch.from_numpy(
                 maddness._calc_matmul(
                     maddness.A_enc,
                     maddness.luts,
                     maddness.offset,
-                    maddness.scale).T)
+                    maddness.scale,
+                    M=k.size(-2)).T)
+            apply_qk_out[:, nth_head] = res.mean(axis=-2).reshape((1, -1))
         return apply_qk_out
 
     
     def apply_wv_mm(self, w, v):
         return torch.matmul(w, v) # TODO 
-        
     
     def scal_dot_attn(self, q, k, v, mask=None):
         #q.size() = [1, nheads, sentence_length, embedding_dim/nheads]
@@ -100,7 +101,7 @@ class IntermidateEmbedding():
         if mask is not None:
             w = w.data.masked_fill_(mask, -torch.finfo(torch.float).max)
             
-        w = w / w.size(-1)
+        w = w / math.sqrt(w.size(-1))
         w = nn.Softmax(dim=-1)(w)
 
         if not self.trained_p:
