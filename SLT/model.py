@@ -10,6 +10,19 @@ import numpy as np
 
 import math
 
+import pickle
+import os
+
+# Saltの各層で、Embedding <-> LUTの復元の時、分布をalpha*x+betaで復元する。(微分可能にはしない)
+# To ADD: Masking.
+
+# TODO LIST:
+
+# 1. SparseMatmul3D (Forward Backward)
+# 2. Pickle Trained Maddness Class
+# 3. Embedding層の分布の共通化, 復元の誤差を計測
+# 4. Fine Tuning (What Layer is needed and What Layer is not needed.)
+
 class SaltConfig():
     def __init__(self,
                  embedding_dim=784,
@@ -22,6 +35,7 @@ class SaltConfig():
                  dim_ffn=512,
                  use_embedding=None,
                  positional_encoder="orthogonal",
+                 maddness_save_path="./maddness_tmp.pickle",
                  dropout=None,
                  maddness=True):
         
@@ -39,6 +53,7 @@ class SaltConfig():
         self.nlayers = nlayers
         self.layer_norm_eps= layer_norm_eps
         self.dim_ffn = dim_ffn
+        self.maddness_save_path = maddness_save_path
         
 
 # Temporary
@@ -74,16 +89,25 @@ class SaltEmbedding(nn.Module):
         self.optimize_embedding()
 
     def load_embedding(self, x):
-        self.embedding.weight = x
+        self.embedding.weight = nn.Parameter(x)
 
     def optimize_embedding(self):
+        if os.path.exists(self.config.maddness_save_path):
+            print(f"Resumption from {self.config.maddness_save_path}")
+            with open(self.config.maddness_save_path, 'rb') as f:
+                self.maddness = pickle.load(f)
+        else:
+            print(f"Constructing binary-tree-splits and LUTs for Embedding.")
+            self.maddness._learn_hash_buckets_and_prototypes(self.embedding.weight.detach().numpy()) # Adding Noises To Increase vocab. ?
+            self.maddness._set_B(self.embedding.weight.detach().numpy().T)
+            with open(self.config.maddness_save_path, 'wb') as f:
+                pickle.dump(self.maddness, f)
+            print(f"The result is saved at {self.config.maddness_save_path}")
         # Obtain LSH, and each centroids.
-        pass
-        #self.maddness._learn_hash_buckets_and_prototypes(self.embedding.weight.detach().numpy())
-        #self.maddness._set_B(self.embedding.weight.detach().numpy().T)
-        # Construct LUT
-
-        # Encoding時にMHAを考慮するの忘れない
+        # headsごとに学習?
+        #
+        #
+        # Encoding時にMHAを考慮するの忘れない (when adding offset)
 
     def forward(self, x):
         """
@@ -193,6 +217,7 @@ def merge_attn(positional_encoder,
         # [batch_size, 1, seq_len, embedding_dim//nheads]
         q_n = q[:, nth_head, :, :]
         k_n = k[:, nth_head, :, :]
+        
         return torch.matmul(q_n, k_n.transpose(-2, -1)).unsqueeze(dim=1) #SparseMatmul3D()(q_n, k_n) # The equivalent to q_n @ k_n.T, returing [batch_size, 1, seq_len, seq_len]
     
     # Compute with Maddness(Sparse)
@@ -250,14 +275,21 @@ class SaltMHA(nn.Module):
         Input: [batch_size, seq_len, embedding_dim]
         """
 
-        q = self.split_heads(source) # Linear Transform?
-        k = self.split_heads(target) # Linear Transform?
+        # Keep Decodeable Q,K,V
+        q = self.split_heads(source)
+        k = self.split_heads(target)
         v = self.split_heads(target)
         
         # Reconstruct Q, K?
         
         w = merge_attn(self.encoder, self.salt_embedding, q, k, alpha=self.alpha, beta=self.beta, gamma=self.gamma)
+        
         # Weighting target by w.
+        # Linear out
+        # [0   1  1] 
+        # [-1  0  1] diag.
+        # [-1 -1  0]
+        
         out =  torch.matmul(w, v) # w <- word[0] * weight[0] + word[1] * weight[1] * ...
         return self.merge_heads(out)
 
@@ -301,7 +333,7 @@ class Block(nn.Module):
     def forward(self, x, y):
         attn = self.mha(self.ln1(x), self.ln2(y))
         y = y + self.ffn(y + attn)
-        return y
+        return y # Embeddingと似たような分布にするために、一旦ここでDecodeする? <- maddness_encode
     
 class SaltGPT(nn.Module):
     def __init__(self, config):
@@ -318,14 +350,19 @@ class SaltGPT(nn.Module):
 
         return y_emb
 
+# TODO: Pickle maddness
 def test():
-    config = SaltConfig(vocab_size=200, embedding_dim=512, nlayers=2, dim_ffn=128)
+    config = SaltConfig(nlayers=2, dim_ffn=128)
+    weights = torch.load('./gpt2-pytorch_model.bin', map_location='cpu' if not torch.cuda.is_available() else None)['wte.weight']
+    config.use_embedding = weights
+    config.vocab_size = weights.size()[0]
+    config.embedding_dim = weights.size()[1]
     model  = SaltGPT(config)
-
-    x = torch.randint(0, config.vocab_size, (10, 30))
-    y = torch.randint(0, config.vocab_size, (10, 30))
+    #model = torch.compile(model)
+    x = torch.randint(0, config.vocab_size, (1, 300))
+    y = torch.randint(0, config.vocab_size, (1, 300))
     out = model(x, y)
-    print(out)
+    print(torch.argmax(out, dim=-1))
     print(out.shape)
     print(((out - model.embedding(y)) ** 2).mean().backward())
 test()
