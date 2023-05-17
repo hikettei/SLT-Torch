@@ -16,7 +16,7 @@ class SaltConfig():
                  nheads=12,
                  C=16,
                  use_embedding=None,
-                 positional_encoder="RNN",
+                 positional_encoder="orthogonal",
                  dropout=None):
         
         assert embedding_dim % nheads == 0
@@ -38,6 +38,7 @@ class SparseMatmul4D(nn.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, y):
+        # forwardはMaddnessで、backwardは通常に？
         ctx.save_for_backward(x)
         ctx.save_for_backward(y)
         return torch.matmul(x, y.T)
@@ -68,6 +69,8 @@ class SaltEmbedding(nn.Module):
         self.maddness._learn_hash_buckets_and_prototypes(self.embedding.weight)
         # Construct LUT
 
+        # Encoding時にMHAを考慮するの忘れない
+
     def forward(self, x):
         """
         Return:
@@ -76,7 +79,7 @@ class SaltEmbedding(nn.Module):
         return self.embedding(x)
 
 
-def time_attention(positional_encoder, salt_embedding, q, k):
+def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
     """
     To -> (RNN) -> To+1 -> To+2 ...
 
@@ -95,6 +98,7 @@ def time_attention(positional_encoder, salt_embedding, q, k):
 
     q [batch_size, nheads, time, embedding_dim//nheads]
     k [batch_size, nheads, time, embedding_dim//nheads]
+    positional_encoder [1, nheads, 1, embedding_dim//nheads]
     """
 
     whole_time = q.size(2)
@@ -102,15 +106,59 @@ def time_attention(positional_encoder, salt_embedding, q, k):
     def apply_time_attn(nth_head):
         qn = q[:, nth_head, :, :].squeeze(1) # [batch_size, time, embedding_dim//nheads]
         kn = k[:, nth_head, :, :].squeeze(1) # [batch_size, time, embedding_dim//nheads]
+        pe_w = positional_encoder[:, nth_head, :, :].squeeze(1) # [batch_size, 1, embedding_dim//nheads]
 
-        for t in range(whole_time):
-            pass
+        # Compare QN [batch_size, whole_time, dim] vs [batch_size, t=0, dim], [batch_size, t=1, dim] ...
+
+        # t=0
+        #        Source             Target
+        #  I have a new pen ... vs    So.
+        #  I have a new pen ... vs  So, So[t+1], So[t+2], So[t+3], ...
+        #
+        # t=1
+        #  I have a new pen ... vs  So, Do, Do[t+1], Do[t+2],      ... 
+        # t=2
+        #  I have a new pen ... vs  So, Do, I, I[t+1], I[t+2],     ...
+        #
+        # t=0~t=current_processing_time = accumlated in cumulative_context. and being reused.
+        #
+        # The total result is normalized
+
+        # should cumulative_context be trainable? (k.weight works as initial-weight i guess)
+        
+        w_ret = torch.zeros((qn.size(0), qn.size(1), qn.size(1))) # [batch_size, time, time]
+        
+        cumulative_context = torch.zeros((kn.size(0), 1, kn.size(-1))) # [batch_size, 1, embedding_dim//nheads]
+        cumulative_context[:, 0, :] += kn[:, 0, :]
+        
+        for t in range(1, whole_time+1):
+            # Here, we predict Words t=n+1 from t=n and compute matmul.
+            # [batch_size, time, embedding_dim//nheads] @ [batch_size, 1, embedding_dim//nheads].T
+
+            # 自信ない・・・
+            cumulative_context = nn.Tanh()(
+                torch.mul(cumulative_context, pe_w.T) # [1 dim] * [1 dim] -> [1 dim]. t=0~t-1, * weight, (Q. Add bias?)
+            )
+            
+            #cumulative_context = nn.Dropout()
+            # qn [batch_size, time, dim] @ cumulative_context[batch_size, 1, dim].T
+            w_ret[:, :, t-1] += torch.matmul(qn, cumulative_context.transpose(-2, -1)) # w_t = [batch_size, time, 1]
+
+            # print(cosine_simirality(kn[:, t, :], cumulative_context)
+            # Update cumulative_context for next iteration
+            cumulative_context = torch.mul(kn[:, t, :], cumulative_context * (1.0 - decay_rate))
+        return w_ret.sum(axis=1) / math.sqrt(q.size(-1)) # Return: [batch_size, 1, time]
         
     time_weights = torch.concat([apply_time_attn(nth) for nth in range(q.size(1))], dim=1)
+    return nn.Softmax(dim=-1)(time_weights)
 
-    return time_weights
-
-def merge_attn(positional_encoder, salt_embedding, q, k):
+def merge_attn(positional_encoder,
+               salt_embedding,
+               q,
+               k,
+               alpha=1.0,
+               beta=1.0,
+               gamma=2.0):
     """
     Merge Attentions:
       1. Semantical Attention. Just computing matmul with no positional embedded embeddings.
@@ -124,7 +172,7 @@ def merge_attn(positional_encoder, salt_embedding, q, k):
     """
     assert q.size() == k.size()
 
-    def apply_merge_attn(nth_head):
+    def apply_semantic_attn(nth_head):
         # Computes semantic_attention by nth_head=0, 1, 2, ...
         # [batch_size, 1, seq_len, embedding_dim//nheads]
         q_n = q[:, nth_head, :, :]
@@ -132,12 +180,15 @@ def merge_attn(positional_encoder, salt_embedding, q, k):
         return SparseMatmul4D()(q_n, k_n) # The equivalent to q_n @ k_n.T, returing [batch_size, 1, seq_len, seq_len]
     
     # Compute with Maddness(Sparse)
-    semantic_w = torch.concat([apply_merge_attn(nth_head) for nth_head in range(q.size(1))], dim=1) # [batch_size, nheads, seq_len, seq_len]
+    semantic_w = torch.concat([apply_semantic_attn(nth_head) for nth_head in range(q.size(1))], dim=1) # [batch_size, nheads, seq_len, seq_len]
 
     # Attention by Time.
     grammar_w  = time_attention(positional_encoder, salt_embedding, q, k)
 
-    return semantic_w, grammar_w
+    # what semantic_w to grammar_w is what Transformer to RNN. (merging global and super wide but low-precise attention, fast but small range attn)
+
+    # Merging
+    return (alpha * semantic_w + beta * grammar_w) / z
 
 class SaltMHA(nn.Module):
     def __init__(self, salt_embedding, config):
@@ -149,22 +200,30 @@ class SaltMHA(nn.Module):
         self.embedding_dim = config.embedding_dim
         self.nheads        = config.nheads
 
-        if config.positional_encoder = "RNN":
-            self.encoder = nn.RNN(config.embedding_dim//config.nheads,
-                                  config.embedding_dim//config.nheads,
-                                  num_layers=1,
-                                  bias=True,
-                                  batch_first=True,
-                                  dropout=config.dropout) # [batch_size, seq_len, dim]
+        if config.positional_encoder = "orthogonal":
+            self.encoder = nn.Parameter(nn.init.orthogonal_(
+                torch.empty(1, config.nheads, 1, config.embedding_dim // config.nheads), gain=1))
+            # [1, nheads, 1, dim]
         else:
-            raise Exception("Choose config.positional_encoder from: RNN")
+            raise Exception("Choose config.positional_encoder from: orthogonal")
         
     def split_heads(self, x):
         """
         Input:   x  [batch_size, seq_len, embedding_dim]
         Return: out [batch_size, nheads, seq_len, embedding_dim//nheads].
         """
-        pass
+        new_x_shape = x.size()[:-1] + (self.nheads, x.size(-1) // self.nheads)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3) # [batch_size, nheads, seq_len, embedding_dim//nheads]
+
         
     def forward(self, source, target):
-        w = merge_attn(self.encoder, self.salt_embedding, source, target)
+
+        q = self.split_heads(source) # Linear Transform?
+        k = self.split_heads(target) # Linear Transform?
+
+        # Reconstruct Q, K?
+        
+        w = merge_attn(self.encoder, self.salt_embedding, q, k)
+
+        
