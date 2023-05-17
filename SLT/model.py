@@ -19,7 +19,7 @@ class SaltConfig():
                  nlayers=6,
                  C=16,
                  layer_norm_eps=1e-12,
-                 dim_ffn=1024,
+                 dim_ffn=512,
                  use_embedding=None,
                  positional_encoder="orthogonal",
                  dropout=None,
@@ -78,8 +78,9 @@ class SaltEmbedding(nn.Module):
 
     def optimize_embedding(self):
         # Obtain LSH, and each centroids.
-        self.maddness._learn_hash_buckets_and_prototypes(self.embedding.weight.detach().numpy())
-        self.maddness._set_B(self.embedding.weight.detach().numpy().T)
+        pass
+        #self.maddness._learn_hash_buckets_and_prototypes(self.embedding.weight.detach().numpy())
+        #self.maddness._set_B(self.embedding.weight.detach().numpy().T)
         # Construct LUT
 
         # Encoding時にMHAを考慮するの忘れない
@@ -251,12 +252,14 @@ class SaltMHA(nn.Module):
 
         q = self.split_heads(source) # Linear Transform?
         k = self.split_heads(target) # Linear Transform?
-
+        v = self.split_heads(target)
+        
         # Reconstruct Q, K?
         
         w = merge_attn(self.encoder, self.salt_embedding, q, k, alpha=self.alpha, beta=self.beta, gamma=self.gamma)
-        w = self.merge_heads(w)
-        return torch.matmul(w.transpose(-2, -1), target)
+        # Weighting target by w.
+        out =  torch.matmul(w, v) # w <- word[0] * weight[0] + word[1] * weight[1] * ...
+        return self.merge_heads(out)
 
 #Ref: https://github.com/graykode/gpt-2-Pytorch/blob/master/GPT2/model.py
 def gelu(x):
@@ -316,7 +319,13 @@ class SaltGPT(nn.Module):
         return y_emb
 
 def test():
-    config = SaltConfig()
+    config = SaltConfig(vocab_size=200, embedding_dim=512, nlayers=2, dim_ffn=128)
     model  = SaltGPT(config)
-    print(model)
+
+    x = torch.randint(0, config.vocab_size, (10, 30))
+    y = torch.randint(0, config.vocab_size, (10, 30))
+    out = model(x, y)
+    print(out)
+    print(out.shape)
+    print(((out - model.embedding(y)) ** 2).mean().backward())
 test()
