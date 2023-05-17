@@ -2,22 +2,23 @@
 import torch
 import torch.nn as nn
 
-from .SLT.maddness_legacy import (
+from .maddness_legacy import (
     MaddnessMatmul
-    )
+)
 
 import numpy as np
 
 class SaltConfig():
     def __init__(self,
                  embedding_dim=784,
-                 vocab_size=5000,
+                 vocab_size=500,
                  pad_idx=0,
-                 nheads=12,
+                 nheads=8,
                  C=16,
                  use_embedding=None,
                  positional_encoder="orthogonal",
-                 dropout=None):
+                 dropout=None,
+                 maddness=True):
         
         assert embedding_dim % nheads == 0
         
@@ -29,15 +30,18 @@ class SaltConfig():
         self.use_embedding = use_embedding # None or torch.Tensor
         self.positional_encoder = positional_encoder
         self.dropout = dropout
+        self.maddness = maddness
+        
 
 # Temporary
 # __init__使えますか?
+"""
 class SparseMatmul4D(nn.autograd.Function):
     def __init__(self, salt_embedding):
         self.salt_embedding = salt_embedding
 
     @staticmethod
-    def forward(ctx, x, y):
+    def forward(ctx, x, y, encoder=None):
         # forwardはMaddnessで、backwardは通常に？
         ctx.save_for_backward(x)
         ctx.save_for_backward(y)
@@ -45,13 +49,13 @@ class SparseMatmul4D(nn.autograd.Function):
 
     @staticmethod
     def backward(ctx, dy):
-        return torch.matmul(ctx.x, dy), torch.matmul(dy, ctx.y)
-
+        return torch.matmul(ctx.x, dy), torch.matmul(dy, ctx.y), None
+"""
 
 class SaltEmbedding(nn.Module):
     def __init__(self, config: SaltConfig):
         super(SaltEmbedding, self).__init__()
-        self.embedding = nn.Embedding(config.embedding_dim, config.vocab_size, pad_idx=config.pad_idx)
+        self.embedding = nn.Embedding(config.vocab_size, config.embedding_dim, padding_idx=config.pad_idx)
         self.C         = config.C * config.nheads
         self.maddness  = MaddnessMatmul(C=self.C)
         self.config    = config
@@ -66,7 +70,7 @@ class SaltEmbedding(nn.Module):
 
     def optimize_embedding(self):
         # Obtain LSH, and each centroids.
-        self.maddness._learn_hash_buckets_and_prototypes(self.embedding.weight)
+        self.maddness._learn_hash_buckets_and_prototypes(self.embedding.weight.detach().numpy())
         # Construct LUT
 
         # Encoding時にMHAを考慮するの忘れない
@@ -177,7 +181,7 @@ def merge_attn(positional_encoder,
         # [batch_size, 1, seq_len, embedding_dim//nheads]
         q_n = q[:, nth_head, :, :]
         k_n = k[:, nth_head, :, :]
-        return SparseMatmul4D()(q_n, k_n) # The equivalent to q_n @ k_n.T, returing [batch_size, 1, seq_len, seq_len]
+        return torch.matmul(q_n, k_n.transpose(-2, -1)) #SparseMatmul4D()(q_n, k_n) # The equivalent to q_n @ k_n.T, returing [batch_size, 1, seq_len, seq_len]
     
     # Compute with Maddness(Sparse)
     semantic_w = torch.concat([apply_semantic_attn(nth_head) for nth_head in range(q.size(1))], dim=1) # [batch_size, nheads, seq_len, seq_len]
@@ -200,12 +204,16 @@ class SaltMHA(nn.Module):
         self.embedding_dim = config.embedding_dim
         self.nheads        = config.nheads
 
-        if config.positional_encoder = "orthogonal":
+        if config.positional_encoder == "orthogonal":
             self.encoder = nn.Parameter(nn.init.orthogonal_(
                 torch.empty(1, config.nheads, 1, config.embedding_dim // config.nheads), gain=1))
             # [1, nheads, 1, dim]
         else:
             raise Exception("Choose config.positional_encoder from: orthogonal")
+
+        self.alpha = nn.Parameter(torch.tensor(1.0))
+        self.beta  = nn.Parameter(torch.tensor(1.0))
+        self.gamma = nn.Parameter(torch.tensor(2.0))
         
     def split_heads(self, x):
         """
@@ -218,12 +226,23 @@ class SaltMHA(nn.Module):
 
         
     def forward(self, source, target):
+        """
+        Input: [batch_size, seq_len, embedding_dim]
+        """
 
         q = self.split_heads(source) # Linear Transform?
         k = self.split_heads(target) # Linear Transform?
 
         # Reconstruct Q, K?
         
-        w = merge_attn(self.encoder, self.salt_embedding, q, k)
+        w = merge_attn(self.encoder, self.salt_embedding, q, k, alpha=self.alpha, beta=self.beta, gamma=self.gamma)
+        return w
 
-        
+def test():
+    config = SaltConfig()
+    emb    = SaltEmbedding(config)
+    mha    = SaltMHA(emb, config)
+    x = torch.randn([10, 100, 784])
+    print(mha(x, x))
+
+test()
