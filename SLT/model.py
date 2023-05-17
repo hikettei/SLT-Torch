@@ -16,7 +16,10 @@ class SaltConfig():
                  vocab_size=500,
                  pad_idx=0,
                  nheads=8,
+                 nlayers=6,
                  C=16,
+                 layer_norm_eps=1e-12,
+                 dim_ffn=1024,
                  use_embedding=None,
                  positional_encoder="orthogonal",
                  dropout=None,
@@ -33,6 +36,9 @@ class SaltConfig():
         self.positional_encoder = positional_encoder
         self.dropout = dropout
         self.maddness = maddness
+        self.nlayers = nlayers
+        self.layer_norm_eps= layer_norm_eps
+        self.dim_ffn = dim_ffn
         
 
 # Temporary
@@ -73,6 +79,7 @@ class SaltEmbedding(nn.Module):
     def optimize_embedding(self):
         # Obtain LSH, and each centroids.
         self.maddness._learn_hash_buckets_and_prototypes(self.embedding.weight.detach().numpy())
+        self.maddness._set_B(self.embedding.weight.detach().numpy().T)
         # Construct LUT
 
         # Encoding時にMHAを考慮するの忘れない
@@ -198,7 +205,7 @@ def merge_attn(positional_encoder,
     # avoid unexcepted broadcasting
     assert semantic_w.shape == grammar_w.shape
     # Ensembling
-    return (alpha * semantic_w + beta * grammar_w) / gamma
+    return nn.Softmax(dim=-1)((alpha * semantic_w + beta * grammar_w) / gamma)
 
 class SaltMHA(nn.Module):
     def __init__(self, salt_embedding, config):
@@ -232,7 +239,11 @@ class SaltMHA(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3) # [batch_size, nheads, seq_len, embedding_dim//nheads]
 
-        
+    def merge_heads(self, x):
+        x = x.permute(0, 2, 1, 3).contiguous()
+        new_x_shape = x.size()[:-2] + (x.size(-2) * x.size(-1),)
+        return x.view(*new_x_shape)
+    
     def forward(self, source, target):
         """
         Input: [batch_size, seq_len, embedding_dim]
@@ -244,13 +255,68 @@ class SaltMHA(nn.Module):
         # Reconstruct Q, K?
         
         w = merge_attn(self.encoder, self.salt_embedding, q, k, alpha=self.alpha, beta=self.beta, gamma=self.gamma)
-        return w
+        w = self.merge_heads(w)
+        return torch.matmul(w.transpose(-2, -1), target)
+
+#Ref: https://github.com/graykode/gpt-2-Pytorch/blob/master/GPT2/model.py
+def gelu(x):
+    return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
+
+class LayerNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-12):
+        """Construct a layernorm module in the TF style (epsilon inside the square root).
+        """
+        super(LayerNorm, self).__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, x):
+        u = x.mean(-1, keepdim=True)
+        s = (x - u).pow(2).mean(-1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.variance_epsilon)
+        return self.weight * x + self.bias
+
+#Ref: https://zenn.dev/yukiyada/articles/59f3b820c52571#3.5-position-wise-feed-forward-networks
+class FFN(nn.Module):
+    def __init__(self, d_model: int, d_ff: int) -> None:
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear2(nn.functional.relu(self.linear1(x)))
+    
+class Block(nn.Module):
+    def __init__(self, embedding_layer, config):
+        super(Block, self).__init__()
+        self.mha = SaltMHA(embedding_layer, config)
+        self.ln1 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
+        self.ln2 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
+        self.ffn = FFN(config.embedding_dim, config.dim_ffn)
+        
+    def forward(self, x, y):
+        attn = self.mha(self.ln1(x), self.ln2(y))
+        y = y + self.ffn(y + attn)
+        return y
+    
+class SaltGPT(nn.Module):
+    def __init__(self, config):
+        super(SaltGPT, self).__init__()
+        self.embedding = SaltEmbedding(config)
+        self.layers = nn.ModuleList([Block(self.embedding, config) for i in range(config.nlayers)])
+
+    def forward(self, x, y):
+        x_emb = self.embedding(x)
+        y_emb = self.embedding(y)
+
+        for layer in self.layers:
+            y_emb = layer(x_emb, y_emb)
+
+        return y_emb
 
 def test():
     config = SaltConfig()
-    emb    = SaltEmbedding(config)
-    mha    = SaltMHA(emb, config)
-    x = torch.randn([10, 100, 784])
-    print(mha(x, x))
-
+    model  = SaltGPT(config)
+    print(model)
 test()
