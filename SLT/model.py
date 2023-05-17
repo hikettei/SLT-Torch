@@ -146,6 +146,8 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
             
             #cumulative_context = nn.Dropout()
             # qn [batch_size, time, dim] @ cumulative_context[batch_size, 1, dim].T
+            print(qn.shape)
+            print(cumulative_context.shape)
             w_ret[:, :, t-1] += torch.matmul(qn, cumulative_context.transpose(-2, -1)) # w_t = [batch_size, time, 1]
 
             # print(cosine_simirality(kn[:, t, :], cumulative_context)
@@ -214,6 +216,8 @@ class SaltMHA(nn.Module):
         self.alpha = nn.Parameter(torch.tensor(1.0))
         self.beta  = nn.Parameter(torch.tensor(1.0))
         self.gamma = nn.Parameter(torch.tensor(2.0))
+
+        # self.scale, self.beta (for reconstructing into x ~ Embedding)
         
     def split_heads(self, x):
         """
