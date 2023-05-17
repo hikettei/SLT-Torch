@@ -8,6 +8,8 @@ from .maddness_legacy import (
 
 import numpy as np
 
+import math
+
 class SaltConfig():
     def __init__(self,
                  embedding_dim=784,
@@ -22,7 +24,7 @@ class SaltConfig():
         
         assert embedding_dim % nheads == 0
         
-        self.embedding_dim = vocab_size
+        self.embedding_dim = embedding_dim
         self.vocab_size = vocab_size
         self.pad_idx = pad_idx
         self.nheads = nheads
@@ -108,9 +110,9 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
     whole_time = q.size(2)
 
     def apply_time_attn(nth_head):
-        qn = q[:, nth_head, :, :].squeeze(1) # [batch_size, time, embedding_dim//nheads]
-        kn = k[:, nth_head, :, :].squeeze(1) # [batch_size, time, embedding_dim//nheads]
-        pe_w = positional_encoder[:, nth_head, :, :].squeeze(1) # [batch_size, 1, embedding_dim//nheads]
+        qn = q[:, nth_head, :, :] # [batch_size, time, embedding_dim//nheads]
+        kn = k[:, nth_head, :, :] # [batch_size, time, embedding_dim//nheads]
+        pe_w = positional_encoder[:, nth_head, :, :] # [batch_size, 1, 1, embedding_dim//nheads]
 
         # Compare QN [batch_size, whole_time, dim] vs [batch_size, t=0, dim], [batch_size, t=1, dim] ...
 
@@ -130,32 +132,32 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
 
         # should cumulative_context be trainable? (k.weight works as initial-weight i guess)
         
-        w_ret = torch.zeros((qn.size(0), qn.size(1), qn.size(1))) # [batch_size, time, time]
-        
+        w_ret = [] # [[batch_size, time, 1] * time]
         cumulative_context = torch.zeros((kn.size(0), 1, kn.size(-1))) # [batch_size, 1, embedding_dim//nheads]
-        cumulative_context[:, 0, :] += kn[:, 0, :]
-        
-        for t in range(1, whole_time+1):
+        cumulative_context += kn[:, 0, :].unsqueeze(1)
+
+        for t in range(0, whole_time):
             # Here, we predict Words t=n+1 from t=n and compute matmul.
             # [batch_size, time, embedding_dim//nheads] @ [batch_size, 1, embedding_dim//nheads].T
 
-            # 自信ない・・・
+            # is it ok?
             cumulative_context = nn.Tanh()(
-                torch.mul(cumulative_context, pe_w.T) # [1 dim] * [1 dim] -> [1 dim]. t=0~t-1, * weight, (Q. Add bias?)
+                torch.mul(cumulative_context, pe_w) # [1 dim] * [1 dim] -> [1 dim]. t=0~t-1, * weight, (Q. Add bias?)
             )
             
-            #cumulative_context = nn.Dropout()
+            # cumulative_context = nn.Dropout()
             # qn [batch_size, time, dim] @ cumulative_context[batch_size, 1, dim].T
-            print(qn.shape)
-            print(cumulative_context.shape)
-            w_ret[:, :, t-1] += torch.matmul(qn, cumulative_context.transpose(-2, -1)) # w_t = [batch_size, time, 1]
-
+            out = torch.matmul(qn, cumulative_context.transpose(-2, -1)) # w_t = [batch_size, time, 1]
+            w_ret.append(out)
             # print(cosine_simirality(kn[:, t, :], cumulative_context)
             # Update cumulative_context for next iteration
-            cumulative_context = torch.mul(kn[:, t, :], cumulative_context * (1.0 - decay_rate))
-        return w_ret.sum(axis=1) / math.sqrt(q.size(-1)) # Return: [batch_size, 1, time]
+            cumulative_context = torch.mul(kn[:, t, :].unsqueeze(1), cumulative_context * (1.0 - decay_rate))
+            # torch.concat(w_ret, dim=-1) -> [batch_size, time, time]
+            # unsqueeze it -> [batch_size, 1, time, time]
+        return torch.concat(w_ret, dim=-1).unsqueeze(dim=1) / math.sqrt(q.size(-1)) # Return: [batch_size, 1, time]
         
     time_weights = torch.concat([apply_time_attn(nth) for nth in range(q.size(1))], dim=1)
+    # time_weights [batch_size, nheads, time]
     return nn.Softmax(dim=-1)(time_weights)
 
 def merge_attn(positional_encoder,
@@ -183,18 +185,20 @@ def merge_attn(positional_encoder,
         # [batch_size, 1, seq_len, embedding_dim//nheads]
         q_n = q[:, nth_head, :, :]
         k_n = k[:, nth_head, :, :]
-        return torch.matmul(q_n, k_n.transpose(-2, -1)) #SparseMatmul4D()(q_n, k_n) # The equivalent to q_n @ k_n.T, returing [batch_size, 1, seq_len, seq_len]
+        return torch.matmul(q_n, k_n.transpose(-2, -1)).unsqueeze(dim=1) #SparseMatmul3D()(q_n, k_n) # The equivalent to q_n @ k_n.T, returing [batch_size, 1, seq_len, seq_len]
     
     # Compute with Maddness(Sparse)
-    semantic_w = torch.concat([apply_semantic_attn(nth_head) for nth_head in range(q.size(1))], dim=1) # [batch_size, nheads, seq_len, seq_len]
+    semantic_w = torch.concat([apply_semantic_attn(nth_head) for nth_head in range(q.size(1))], dim=1) / 100.0 # [batch_size, nheads, seq_len, seq_len]
 
     # Attention by Time.
     grammar_w  = time_attention(positional_encoder, salt_embedding, q, k)
 
     # what semantic_w to grammar_w is what Transformer to RNN. (merging global and super wide but low-precise attention, fast but small range attn)
 
-    # Merging
-    return (alpha * semantic_w + beta * grammar_w) / z
+    # avoid unexcepted broadcasting
+    assert semantic_w.shape == grammar_w.shape
+    # Ensembling
+    return (alpha * semantic_w + beta * grammar_w) / gamma
 
 class SaltMHA(nn.Module):
     def __init__(self, salt_embedding, config):
