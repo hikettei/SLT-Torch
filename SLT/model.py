@@ -71,7 +71,7 @@ class SaltConfig():
                  maddness_save_path="./maddness_tmp.pickle",
                  opt_forward=True,
                  opt_backward=True,
-                 dropout=None,
+                 dropout=0.5,
                  maddness=True):
         
         assert embedding_dim % nheads == 0
@@ -172,7 +172,8 @@ class SparseMatmul3dNode(torch.autograd.Function):
     @staticmethod
     def forward(x, y, encoder=None):
         # Encoder = SaltEmbedding
-        
+
+        #out = torch.matmul(x, y.transpose(-2, -1))
         A_enc = encoder.diffusion.encode_state(x)
         B_enc = encoder.diffusion.encode_state(y)
         out = encoder.diffusion.apply(A_enc, B_enc)
@@ -363,9 +364,8 @@ def merge_attn(positional_encoder,
                salt_embedding,
                q,
                k,
-               alpha=1.0,
-               beta=1.0,
-               gamma=2.0):
+               W_s,
+               W_g):
     """
     Merge Attentions:
       1. Semantical Attention. Just computing matmul with no positional embedded embeddings.
@@ -398,9 +398,7 @@ def merge_attn(positional_encoder,
     # avoid unexcepted broadcasting
     assert semantic_w.shape == grammar_w.shape
     # Ensembling
-
-    # Note: semantic_w, grammar_wにLinearを通す必要があると思う。 (Q_W, K_Wを廃止する代わりに), MHAに入力するsource/targetはいつでもEmbeddingに復元できるように
-    return nn.Softmax(dim=-1)((alpha * semantic_w + beta * grammar_w) / gamma)
+    return nn.Softmax(dim=-1)(W_s(semantic_w) + W_g(grammar_w))
 
 class SaltMHA(nn.Module):
     def __init__(self, salt_embedding, config):
@@ -419,11 +417,8 @@ class SaltMHA(nn.Module):
         else:
             raise Exception("Choose config.positional_encoder from: orthogonal")
 
-        self.alpha = nn.Parameter(torch.tensor(1.0))
-        self.beta  = nn.Parameter(torch.tensor(1.0))
-        self.gamma = nn.Parameter(torch.tensor(2.0))
-
-        # self.scale, self.beta (for reconstructing into x ~ Embedding)
+        self.W_s = nn.SiLU()
+        self.W_g = nn.SiLU()
         
     def split_heads(self, x):
         """
@@ -451,15 +446,17 @@ class SaltMHA(nn.Module):
         
         # Reconstruct Q, K?
         
-        w = merge_attn(self.encoder, self.salt_embedding, q, k, alpha=self.alpha, beta=self.beta, gamma=self.gamma)
+        w = merge_attn(self.encoder, self.salt_embedding, q, k, self.W_s, self.W_g)
         
         # Weighting target by w.
         # Linear out
         # [0   1  1] 
         # [-1  0  1] diag.
         # [-1 -1  0]
+
+        # Global/LocalなAttentionは線形分離可能か？
         
-        out =  torch.matmul(w, v) # w <- word[0] * weight[0] + word[1] * weight[1] * ...
+        out = torch.matmul(w, v) # w <- word[0] * weight[0] + word[1] * weight[1] * ...
         return self.merge_heads(out)
 
 #Ref: https://github.com/graykode/gpt-2-Pytorch/blob/master/GPT2/model.py
@@ -497,12 +494,19 @@ class Block(nn.Module):
         self.mha = SaltMHA(embedding_layer, config)
         self.ln1 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
         self.ln2 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
-        self.ffn = FFN(config.embedding_dim, config.dim_ffn)
+        self.ffn1 = FFN(config.embedding_dim, config.dim_ffn)
+        self.ffn2 = FFN(config.embedding_dim, config.dim_ffn)
         
     def forward(self, x, y):
-        attn = self.mha(self.ln1(x), self.ln2(y))
-        y = y + self.ffn(y + attn)
-        return y # Embeddingと似たような分布にするために、一旦ここでDecodeする? <- maddness_encode
+        # Convection Step
+        y = y + (0.5 * self.ffn1(self.ln1(y))) # Pre-LN
+
+        # Diffusion Step
+        attn = self.mha(x, y)
+
+        # Convection Step Again
+        y = y + (0.5 * self.ffn2(self.ln2(y + attn)))
+        return y
     
 class SaltGPT(nn.Module):
     def __init__(self, config):
@@ -521,7 +525,8 @@ class SaltGPT(nn.Module):
 
 # TODO: Pickle maddness
 def test():
-    config = SaltConfig(nlayers=2, dim_ffn=128)
+    import time
+    config = SaltConfig(nlayers=6, dim_ffn=512)
     #weights = torch.load('./gpt2-pytorch_model.bin', map_location='cpu' if not torch.cuda.is_available() else None)['wte.weight']
     #config.use_embedding = weights
     config.maddness_save_path = "./tmp1.pickle"
@@ -531,8 +536,16 @@ def test():
     #model = torch.compile(model)
     x = torch.randint(0, config.vocab_size, (3, 300))
     y = torch.randint(0, config.vocab_size, (3, 300))
+    t1 = time.time()
     out = model(x, y)
+    t2 = time.time()
+    print(f"{t2 - t1} sec (first iter)")
     print(torch.argmax(out, dim=-1))
     print(out.shape)
     print(((out - model.embedding(y)) ** 2).mean().backward())
+
+    t1 = time.time()
+    out = model(x, y)
+    t2 = time.time()
+    print(f"{t2 - t1} sec (second iter)")
 test()
