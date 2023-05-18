@@ -171,7 +171,13 @@ def aggregate_enc(A_enc: np.ndarray, B_enc: np.ndarray, luts: np.ndarray):
 class SparseMatmul3dNode(torch.autograd.Function):
     @staticmethod
     def forward(x, y, encoder=None):
-        return torch.matmul(x, y)
+        # Encoder = SaltEmbedding
+        
+        A_enc = encoder.diffusion.encode_state(x)
+        B_enc = encoder.diffusion.encode_state(y)
+        out = encoder.diffusion.apply(A_enc, B_enc)
+        return out
+    
     @staticmethod
     def setup_context(ctx, inputs, outputs):
         x, y, _ = inputs
@@ -180,14 +186,12 @@ class SparseMatmul3dNode(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy):
         x, y = ctx.saved_tensors
-        return torch.matmul(dy, y.transpose(-2, -1)), torch.matmul(x.transpose(-1, -2), dy), None
+        return torch.matmul(dy.transpose(-2, -1), y), torch.matmul(x.transpose(-2, -1), dy).transpose(-2, -1), None
 
 class SparseMatmul3D(nn.Module):
     def __init__(self, encoder):
         super(SparseMatmul3D, self).__init__()
         self.encoder = encoder
-        self.maddness = encoder.maddness
-        self.diff = encoder.diffusion
 
     def forward(self, x, y):
         """
@@ -195,15 +199,9 @@ class SparseMatmul3D(nn.Module):
           x - [batch_size, N, D]
           y - [batch_size, M, D]
         """
-
-        luts = self.maddness.luts
-        A_enc = self.diff.encode_state(x)
-        B_enc = self.diff.encode_state(y)
-
-        out = aggregate_enc(A_enc[0], B_enc[0], luts)
-        print(out)
+        
         if self.encoder.config.opt_forward:
-            return SparseMatmul3dNode.apply(x, y.transpose(-2, -1), self.encoder)
+            return SparseMatmul3dNode.apply(x, y, self.encoder)
         else:
             return torch.matmul(x, y.transpose(-2, -1))
     
@@ -275,6 +273,13 @@ class IndexingDiffusion():
         #        ...
         # LUT's size is that: 256 * C = 14336.
         return out
+
+    def apply(self, x_enc, y_enc):
+        out = np.zeros((x_enc.shape[0], x_enc.shape[1], y_enc.shape[1]), dtype=np.float32)
+        for nth in range(x_enc.shape[0]):
+            out[nth] = aggregate_enc(x_enc[nth], y_enc[nth], self.maddness.luts)
+
+        return torch.from_numpy(out)
 
 
 def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
