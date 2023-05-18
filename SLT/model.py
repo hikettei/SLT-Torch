@@ -277,7 +277,7 @@ class IndexingDiffusion():
         return torch.from_numpy(out)
 
 
-def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.05):
+def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.008):
     """
     To -> (RNN) -> To+1 -> To+2 ...
 
@@ -304,7 +304,7 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.05):
     def apply_time_attn(nth_head):
         qn = q[:, nth_head, :, :] # [batch_size, time, embedding_dim//nheads]
         kn = k[:, nth_head, :, :] # [batch_size, time, embedding_dim//nheads]
-        pe_w = positional_encoder[:, nth_head, :, :] # [batch_size, 1, 1, embedding_dim//nheads]
+        pe_w = positional_encoder[nth_head] # RNN
 
         # Compare QN [batch_size, whole_time, dim] vs [batch_size, t=0, dim], [batch_size, t=1, dim] ...
 
@@ -327,10 +327,11 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.05):
         # should cumulative_context be trainable? (k.weight works as initial-weight i guess)
         
         w_ret = [] # [[batch_size, time, 1] * time]
-        cumulative_context = torch.zeros((kn.size(0), 1, kn.size(-1))) # [batch_size, 1, embedding_dim//nheads]
-        cumulative_context += kn[:, 0, :].unsqueeze(1)
 
-        out = torch.matmul(qn, cumulative_context.transpose(-2, -1))
+        next_word, hidden_state = pe_w(kn[:, 0, :].unsqueeze(1))
+
+        # [batch_size, whole_time, dim] @ [batch_size, 1, dim]
+        out = torch.matmul(qn, next_word.transpose(-2, -1))
         w_ret.append(out)
 
         for t in range(1, whole_time):
@@ -338,21 +339,16 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.05):
             # [batch_size, time, embedding_dim//nheads] @ [batch_size, 1, embedding_dim//nheads].T
 
             # get cumulative_context[t+1]
-            cumulative_context = nn.Tanh()(
-                torch.mul(cumulative_context, pe_w) # [1 dim] * [1 dim] -> [1 dim]. t=0~t-1, * weight, (Q. Add bias?)
-            )
+            next_word, hidden_state = pe_w(kn[:, t, :].unsqueeze(1), hidden_state * (1.0 - decay_rate))
             
             # cumulative_context = nn.Dropout()
-            # qn [batch_size, time, dim] @ cumulative_context[batch_size, 1, dim].T
-            out = torch.matmul(qn, cumulative_context.transpose(-2, -1)) # w_t = [batch_size, time, 1]
+            # qn [batch_size, time, dim] @ cumulative_context[batch_size, hidden_dim, dim]
+            
+            out = torch.matmul(qn, next_word.transpose(-2, -1))
             w_ret.append(out)
 
             #print(np.matmul(kn[:, t, :].detach().numpy(), cumulative_context.detach().numpy().transpose(-2, -1)))
             
-            # Update cumulative_context for next iteration
-            cumulative_context = nn.Tanh()(torch.mul(kn[:, t, :].unsqueeze(1), cumulative_context * (1.0 - decay_rate)))
-            # torch.concat(w_ret, dim=-1) -> [batch_size, time, time]
-            # unsqueeze it -> [batch_size, 1, time, time]
         return torch.concat(w_ret, dim=-1).unsqueeze(dim=1) / math.sqrt(q.size(-1)) # Return: [batch_size, 1, time]
         
     time_weights = torch.concat([apply_time_attn(nth) for nth in range(q.size(1))], dim=1)
@@ -387,7 +383,7 @@ def merge_attn(positional_encoder,
         return SparseMatmul3D(salt_embedding)(q_n, k_n).unsqueeze(dim=1) #SparseMatmul3D()(q_n, k_n) # The equivalent to q_n @ k_n.T, returing [batch_size, 1, seq_len, seq_len]
     
     # Compute with Maddness(Sparse)
-    semantic_w = torch.concat([apply_semantic_attn(nth_head) for nth_head in range(q.size(1))], dim=1) / 100.0 # [batch_size, nheads, seq_len, seq_len]
+    semantic_w = torch.concat([apply_semantic_attn(nth_head) for nth_head in range(q.size(1))], dim=1) # / 100.0  # [batch_size, nheads, seq_len, seq_len]
 
     # Attention by Time.
     grammar_w  = time_attention(positional_encoder, salt_embedding, q, k)
@@ -411,9 +407,10 @@ class SaltMHA(nn.Module):
         self.nheads        = config.nheads
 
         if config.positional_encoder == "orthogonal":
-            self.encoder = nn.Parameter(nn.init.orthogonal_(
-                torch.empty(1, config.nheads, 1, config.embedding_dim // config.nheads), gain=1))
-            # [1, nheads, 1, dim]
+            size = config.embedding_dim // config.nheads
+            self.encoder = nn.ModuleList([
+                nn.RNN(size, size, batch_first=True) for i in range(config.nheads)
+            ])
         else:
             raise Exception("Choose config.positional_encoder from: orthogonal")
 
@@ -421,6 +418,10 @@ class SaltMHA(nn.Module):
         self.W_g = nn.SiLU()
         size = config.embedding_dim // config.nheads
         self.W_v = nn.Parameter(nn.init.orthogonal_(
+            torch.empty(1, config.nheads, size, size), gain=1))
+        self.W_k = nn.Parameter(nn.init.orthogonal_(
+            torch.empty(1, config.nheads, size, size), gain=1))
+        self.W_q = nn.Parameter(nn.init.orthogonal_(
             torch.empty(1, config.nheads, size, size), gain=1))
         
     def split_heads(self, x):
@@ -441,24 +442,19 @@ class SaltMHA(nn.Module):
         """
         Input: [batch_size, seq_len, embedding_dim]
         """
-
         # TODO: Q, K, V
         q = self.split_heads(source)
         k = self.split_heads(target)
         v = self.split_heads(target)
 
+        q = torch.matmul(v, self.W_q)
+        k = torch.matmul(v, self.W_k)
         v = torch.matmul(v, self.W_v)
         
         # Reconstruct Q, K?
         
         w = merge_attn(self.encoder, self.salt_embedding, q, k, self.W_s, self.W_g)
         
-        # Weighting target by w.
-        # Linear out
-        # [0   1  1] 
-        # [-1  0  1] diag.
-        # [-1 -1  0]
-
         # Global/LocalなAttentionは線形分離可能か？
         
         out = torch.matmul(w, v) # w <- word[0] * weight[0] + word[1] * weight[1] * ...
