@@ -72,7 +72,8 @@ class SaltConfig():
                  opt_forward=True,
                  opt_backward=True,
                  dropout=0.5,
-                 maddness=True):
+                 maddness=True,
+                 diffusion_step=10):
         
         assert embedding_dim % nheads == 0
         
@@ -91,6 +92,7 @@ class SaltConfig():
         self.maddness_save_path = maddness_save_path
         self.opt_forward = opt_forward
         self.opt_backward = opt_backward
+        self.diffusion_step = diffusion_step
 
 def construct_sparse_embedding(weight: np.ndarray, weight_enc: np.ndarray, C: int, K:int = 16):
     """
@@ -216,12 +218,14 @@ class SaltEmbedding(nn.Module):
 
         if config.use_embedding is not None:
             self.load_embedding(config.use_embedding)
-        
-        self.optimize_embedding()
+
+        if config.opt_forward or config.opt_backward:
+            self.optimize_embedding()
 
     def load_embedding(self, x):
         print(f"Vocab_Size: {x.size(0)} Embedding_dim: {x.size(1)}")
         self.embedding.weight = nn.Parameter(x)
+        self.embedding.weight.requires_grad = False
 
     def optimize_embedding(self):
         if os.path.exists(self.config.maddness_save_path):
@@ -300,8 +304,8 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
     
     Assume that each hidden_state can be reconstructed by SaltEmbedding.weight's all prototypes.
 
-    q [batch_size, nheads, time, embedding_dim//nheads]
-    k [batch_size, nheads, time, embedding_dim//nheads]
+    q [batch_size, nheads, time1, embedding_dim//nheads]
+    k [batch_size, nheads, time2, embedding_dim//nheads]
     positional_encoder [1, nheads, 1, embedding_dim//nheads]
     """
 
@@ -374,8 +378,8 @@ def merge_attn(positional_encoder,
     s_attn = softmax(Q@K/sqrt(dim))
 
     Inputs:
-      query   (Input Source) [batch_size, nheads, seq_len, embedding_dim//nheads]
-      keyword (Input Target) [batch_size, nheads, seq_len, embedding_dim//nheads]
+      query   (Input Source) [batch_size, nheads, seq_len1, embedding_dim//nheads]
+      keyword (Input Target) [batch_size, nheads, seq_len2, embedding_dim//nheads]
     """
     assert q.size() == k.size()
 
@@ -397,6 +401,7 @@ def merge_attn(positional_encoder,
 
     # avoid unexcepted broadcasting
     assert semantic_w.shape == grammar_w.shape
+    
     # Ensembling
     return nn.Softmax(dim=-1)(W_s(semantic_w) + W_g(grammar_w))
 
@@ -439,7 +444,7 @@ class SaltMHA(nn.Module):
         Input: [batch_size, seq_len, embedding_dim]
         """
 
-        # Keep Decodeable Q,K,V
+        # TODO: Q, K, V
         q = self.split_heads(source)
         k = self.split_heads(target)
         v = self.split_heads(target)
@@ -465,7 +470,8 @@ def gelu(x):
 
 class LayerNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-12):
-        """Construct a layernorm module in the TF style (epsilon inside the square root).
+        """
+        Construct a layernorm module in the TF style (epsilon inside the square root).
         """
         super(LayerNorm, self).__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -513,15 +519,29 @@ class SaltGPT(nn.Module):
         super(SaltGPT, self).__init__()
         self.embedding = SaltEmbedding(config)
         self.layers = nn.ModuleList([Block(self.embedding, config) for i in range(config.nlayers)])
+        self.linear_out = nn.Linear(config.embedding_dim, config.vocab_size)
 
-    def forward(self, x, y):
+    def forward(self, x, y, y_past=None, is_last=False):
         x_emb = self.embedding(x)
-        y_emb = self.embedding(y)
+        y_emb = self.embedding(y) if y_past is None else y_past
 
         for layer in self.layers:
             y_emb = layer(x_emb, y_emb)
 
-        return y_emb
+        if is_last:
+            return self.linear_out(y_emb)
+        else:
+            return y_emb
+
+def step_model(config, model, x, y):
+    """
+    
+    """
+    y_past = None
+    for n in range(config.diffusion_step-1):
+        y_past = model(x, y, y_past=y_past)
+
+    return model(x, y, y_past=y_past, is_last=True)
 
 # TODO: Pickle maddness
 def test():
@@ -548,4 +568,3 @@ def test():
     out = model(x, y)
     t2 = time.time()
     print(f"{t2 - t1} sec (second iter)")
-test()
