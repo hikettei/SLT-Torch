@@ -61,7 +61,7 @@ class SaltConfig():
                  maddness_save_path="./maddness_tmp.pickle",
                  opt_forward=True,
                  opt_backward=True,
-                 dropout=0.5,
+                 dropout=0.9,
                  maddness=True,
                  diffusion_step=10):
         
@@ -277,7 +277,7 @@ class IndexingDiffusion():
         return torch.from_numpy(out)
 
 
-def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.008):
+def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
     """
     To -> (RNN) -> To+1 -> To+2 ...
 
@@ -343,7 +343,7 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.008):
             
             # cumulative_context = nn.Dropout()
             # qn [batch_size, time, dim] @ cumulative_context[batch_size, hidden_dim, dim]
-            
+
             out = torch.matmul(qn, next_word.transpose(-2, -1))
             w_ret.append(out)
 
@@ -353,7 +353,7 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.008):
         
     time_weights = torch.concat([apply_time_attn(nth) for nth in range(q.size(1))], dim=1)
     # time_weights [batch_size, nheads, time]
-    return nn.Softmax(dim=-1)(time_weights)
+    return time_weights#nn.Softmax(dim=-1)(time_weights)
 
 def merge_attn(positional_encoder,
                salt_embedding,
@@ -380,7 +380,7 @@ def merge_attn(positional_encoder,
         q_n = q[:, nth_head, :, :]
         k_n = k[:, nth_head, :, :]
         
-        return SparseMatmul3D(salt_embedding)(q_n, k_n).unsqueeze(dim=1) #SparseMatmul3D()(q_n, k_n) # The equivalent to q_n @ k_n.T, returing [batch_size, 1, seq_len, seq_len]
+        return SparseMatmul3D(salt_embedding)(q_n, k_n).unsqueeze(dim=1) / math.sqrt(q_n.size(-1)) # The equivalent to q_n @ k_n.T, returing [batch_size, 1, seq_len, seq_len]
     
     # Compute with Maddness(Sparse)
     semantic_w = torch.concat([apply_semantic_attn(nth_head) for nth_head in range(q.size(1))], dim=1) # / 100.0  # [batch_size, nheads, seq_len, seq_len]
@@ -391,10 +391,12 @@ def merge_attn(positional_encoder,
     # what semantic_w to grammar_w is what Transformer to RNN. (merging global and super wide but low-precise attention, fast but small range attn)
 
     # avoid unexcepted broadcasting
-    assert semantic_w.shape == grammar_w.shape
+    #assert semantic_w.shape == grammar_w.shape
     
     # Ensembling
-    return nn.Softmax(dim=-1)(W_s(semantic_w) + W_g(grammar_w))
+    #return nn.Softmax(dim=-1)(W_s(semantic_w) + W_g(grammar_w))
+
+    return nn.Softmax(dim=-1)(W_s(semantic_w) + W_g(grammar_w / math.sqrt(grammar_w.size(-1)))) / 2.0
 
 class SaltMHA(nn.Module):
     def __init__(self, salt_embedding, config):
@@ -417,12 +419,20 @@ class SaltMHA(nn.Module):
         self.W_s = nn.SiLU()
         self.W_g = nn.SiLU()
         size = config.embedding_dim // config.nheads
-        self.W_v = nn.Parameter(nn.init.orthogonal_(
-            torch.empty(1, config.nheads, size, size), gain=1))
-        self.W_k = nn.Parameter(nn.init.orthogonal_(
-            torch.empty(1, config.nheads, size, size), gain=1))
+        
         self.W_q = nn.Parameter(nn.init.orthogonal_(
             torch.empty(1, config.nheads, size, size), gain=1))
+
+        self.W_v = nn.Parameter(nn.init.orthogonal_(
+            torch.empty(1, config.nheads, size, size), gain=1))
+
+        self.dropoutq = nn.Dropout(config.dropout)
+        self.dropoutk = nn.Dropout(config.dropout)
+        self.dropoutv = nn.Dropout(config.dropout)
+        #self.W_k = nn.Parameter(nn.init.orthogonal_(
+        #    torch.empty(1, config.nheads, size, size), gain=1))
+        #self.W_q = nn.Parameter(nn.init.orthogonal_(
+        #    torch.empty(1, config.nheads, size, size), gain=1))
         
     def split_heads(self, x):
         """
@@ -443,18 +453,17 @@ class SaltMHA(nn.Module):
         Input: [batch_size, seq_len, embedding_dim]
         """
         # TODO: Q, K, V
+        
         q = self.split_heads(source)
         k = self.split_heads(target)
         v = self.split_heads(target)
 
-        q = torch.matmul(v, self.W_q)
-        k = torch.matmul(v, self.W_k)
+        q = torch.matmul(q, self.W_q)
         v = torch.matmul(v, self.W_v)
         
-        # Reconstruct Q, K?
+        q, k, v = self.dropoutq(q), self.dropoutk(k), self.dropoutv(v)
         
         w = merge_attn(self.encoder, self.salt_embedding, q, k, self.W_s, self.W_g)
-        
         # Global/LocalなAttentionは線形分離可能か？
         
         out = torch.matmul(w, v) # w <- word[0] * weight[0] + word[1] * weight[1] * ...
@@ -498,16 +507,20 @@ class Block(nn.Module):
         self.ln2 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
         self.ffn1 = FFN(config.embedding_dim, config.dim_ffn)
         self.ffn2 = FFN(config.embedding_dim, config.dim_ffn)
+
+        self.dropout1 = nn.Dropout(config.dropout)
+        self.dropout2 = nn.Dropout(config.dropout)
+        self.dropout3 = nn.Dropout(config.dropout)
         
     def forward(self, x, y):
         # Convection Step
-        y = y + (0.5 * self.ffn1(self.ln1(y))) # Pre-LN
+        y = y + (0.5 * self.dropout1(self.ffn1(self.ln1(y)))) # Pre-LN
 
         # Diffusion Step
-        attn = self.mha(x, y)
+        attn = self.dropout2(self.mha(x, y))
 
         # Convection Step Again
-        y = y + (0.5 * self.ffn2(self.ln2(y + attn)))
+        y = y + (0.5 * self.dropout3(self.ffn2(self.ln2(y + attn))))
         return y
     
 class SaltGPT(nn.Module):

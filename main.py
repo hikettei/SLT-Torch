@@ -35,78 +35,64 @@ def padding(x, y):
 config = SaltConfig(opt_forward=False,
                     opt_backward=False,
                     nlayers=3,
-                    dim_ffn=512,
-                    diffusion_step=3)
+                    dim_ffn=128,
+                    diffusion_step=1)
 
 weights = torch.load('./gpt2-pytorch_model.bin', map_location='cpu' if not torch.cuda.is_available() else None)['wte.weight']
 config.use_embedding = weights
 config.vocab_size = weights.size()[0]
 config.embedding_dim = weights.size()[1]
 
-source = """[BOS]
-Inspired by the relationship between the ODE and neural networks [25, 8], we first show that the
-Transformer layers can be naturally interpreted as a numerical ODE solver for a first-order convectiondiffusion equation in MPDS. To be more specific, the self-attention sub-layer, which transforms
-the semantics at one position by attending over all other positions, corresponds to the diffusion
-term; The position-wise FFN sub-layer, which is applied to each position separately and identically,
-corresponds to the convection term. The number of stacked layers in the Transformer corresponds to
-the time dimension in ODE. In this way, the stack of self-attention sub-layers and position-wise FFN
-sub-layers with residual connections can be viewed as solving the ODE problem numerically using
-the Lie-Trotter splitting scheme [17] and the Euler’s method [3]. By this interpretation, we have
-a novel understanding of learning contextual representations of a sentence using the Transformer:
-the feature (a.k.a, embedding) of words in a sequence can be considered as the initial positions of a
-collection of particles, and the latent representations abstracted in stacked Transformer layers can be
-viewed as the location of particles moving in a high-dimensional space at different time points
-""".replace("\n", "")
+source = """[BOS]Sapporo[a] (札幌市, Sapporo-shi, IPA: [sapːoɾo ɕi]) (Ainu: サッ・ポロ・ペッ, romanized: Satporopet, lit. 'Dry, Great River')[2] is a city in Japan. It is the largest city north of Tokyo and the largest city on Hokkaido, the northernmost main island of the country. It ranks as the fifth most populous city in Japan. It is the capital city of Hokkaido Prefecture and Ishikari Subprefecture. Sapporo lies in the southwest of Hokkaido, within the alluvial fan of the Toyohira River, which is a tributary stream of the Ishikari. It is considered the cultural, economic, and political center of Hokkaido.
 
-target = """[BOS]
-Such an interpretation not only provides a new perspective on the Transformer but also inspires us
-to design new structures by leveraging the rich literature of numerical analysis. The Lie-Trotter
-splitting scheme is simple but not accurate and often leads to high approximation error [17]. The
-Strang-Marchuk splitting scheme [39] is developed to reduce the approximation error by a simple
-modification to the Lie-Trotter splitting scheme and is theoretically more accurate. Mapped to neural
-network design, the Strang-Marchuk splitting scheme suggests that there should be three sub-layers:
-two position-wise feed-forward sub-layers with half-step residual connections and one self-attention
-sub-layer placed in between with a full-step residual connection. By doing so, the stacked layers will
-be more accurate from the ODE’s perspective and will lead to better performance in deep learning.
-As the FFN-attention-FFN layer is Macaron-like, we call it Macaron layer and call the network
-composed of Macaron layers the Macaron Net.
-We conduct extensive experiments on both supervised and unsupervised learning tasks. For each task,
-we replace Transformer layers by Macaron layers and keep the number of parameters to be the same.
-Experiments show that the Macaron Net can achieve higher accuracy than the Transformer on all
-tasks which, in a way, is consistent with the ODE theory.
-""".replace("\n", "")
+As with most of Hokkaido, the Sapporo area was settled by the indigenous Ainu people, beginning over 15,000 years ago. Starting in the late 19th century, Sapporo saw increasing settlement by Yamato migrants. Sapporo hosted the 1972 Winter Olympics, the first Winter Olympics ever held in Asia, and the second Olympic games held in Japan after the 1964 Summer Olympics. Sapporo is currently bidding for the 2030 Winter Olympics.[3] The Sapporo Dome hosted three games during the 2002 FIFA World Cup and two games during the 2019 Rugby World Cup. Additionally, Sapporo has hosted the Asian Winter Games three times, in 1986, 1990, and 2017 and the 1991 Winter Universiade.
 
+The annual Sapporo Snow Festival draws more than 2 million tourists from abroad.[4] Other notable sites include the Sapporo Beer Museum, which is the only beer museum in Japan,[5] and the Sapporo TV Tower located in Odori Park. It is home to Hokkaido University, just north of Sapporo Station. The city is served by Okadama Airport and New Chitose Airport in nearby Chitose.
+""".replace("\n", "[SEP]").replace(".", "[SEP]")
+
+target = """[BOS]Sapporo[a] (札幌市, Sapporo-shi, IPA: [sapːoɾo ɕi]) (Ainu: サッ・ポロ・ペッ, romanized: Satporopet, lit. 'Dry, Great River')[2] is a city in Japan. It is the largest city north of Tokyo and the largest city on Hokkaido, the northernmost main island of the country. It ranks as the fifth most populous city in Japan. It is the capital city of Hokkaido Prefecture and Ishikari Subprefecture. Sapporo lies in the southwest of Hokkaido, within the alluvial fan of the Toyohira River, which is a tributary stream of the Ishikari. It is considered the cultural, economic, and political center of Hokkaido.
+
+As with most of Hokkaido, the Sapporo area was settled by the indigenous Ainu people, beginning over 15,000 years ago. Starting in the late 19th century, Sapporo saw increasing settlement by Yamato migrants. Sapporo hosted the 1972 Winter Olympics, the first Winter Olympics ever held in Asia, and the second Olympic games held in Japan after the 1964 Summer Olympics. Sapporo is currently bidding for the 2030 Winter Olympics.[3] The Sapporo Dome hosted three games during the 2002 FIFA World Cup and two games during the 2019 Rugby World Cup. Additionally, Sapporo has hosted the Asian Winter Games three times, in 1986, 1990, and 2017 and the 1991 Winter Universiade.
+
+The annual Sapporo Snow Festival draws more than 2 million tourists from abroad.[4] Other notable sites include the Sapporo Beer Museum, which is the only beer museum in Japan,[5] and the Sapporo TV Tower located in Odori Park. It is home to Hokkaido University, just north of Sapporo Station. The city is served by Okadama Airport and New Chitose Airport in nearby Chitose.
+""".replace("\n", "[SEP]").replace(".", "[SEP]")
+
+start_sentence = """[BOS]"""
 
 bpe_tokenizer = encoder.get_encoder()
 
 model  = SaltGPT(config)
-optimizer = optim.Adam(model.parameters(), lr=1e-4)
-criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
 x_sentence = bpe_tokenizer.encode(source)
 y_sentence = bpe_tokenizer.encode(target)
+s_sentence = bpe_tokenizer.encode(start_sentence)
 
 x_sentence, y_sentence = padding(x_sentence, y_sentence)
+y_sentence, s_sentence = padding(y_sentence, s_sentence)
 
 x = torch.tensor(x_sentence).unsqueeze(0)
 y = torch.tensor(y_sentence).unsqueeze(0)
+start = torch.tensor(s_sentence).unsqueeze(0)
 
 print(x.size())
 print(y.size())
+print(start.size())
 
 def train(config, model, optimizer, x, y):
     model.train()
     optimizer.zero_grad()
-    y_out = step_model(config, model, x, y)
+    y_out = step_model(config, model, x, start)
     loss = 0.0
-    for n in range(y.size(1)):
-        loss += criterion(y_out[:, n, :], y[:, n])
+    for n in range(y.size(1)-1):
+        loss += criterion(y_out[:, n, :], y[:, n-1])
     loss.backward()
     print(f"loss: {loss / y.size(1)}")
     optimizer.step()
-    generate_sentence(config, model, "[BOS] Inspired by the relationship.")
+    generate_sentence(config, model, "[BOS]Sapporo is a city")
 
-def generate_sentence(config, model, source, input_more="", sentence_len=50):
+def generate_sentence(config, model, source, input_more="The answer is that:", sentence_len=50):
     x_first = source
     y_first = "[BOS]" + input_more
     
@@ -129,10 +115,10 @@ def generate_sentence(config, model, source, input_more="", sentence_len=50):
         y_decode = torch.argmax(y_out, dim=-1)
         print(bpe_tokenizer.decode(y_decode[0].tolist()))
 
-generate_sentence(config, model, "[BOS] Inspired by the relationship")
+generate_sentence(config, model, "[BOS] Sapporo is a city")
     
 
-for i in tqdm(range(10)):
+for i in tqdm(range(1000)):
     train(config, model, optimizer, x, y)
 
 while True:
