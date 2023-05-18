@@ -18,6 +18,8 @@ import os
 
 from tqdm import tqdm
 import numba
+from numba import prange
+
 # Saltの各層で、Embedding <-> LUTの復元の時、分布をalpha*x+betaで復元する。(微分可能にはしない)
 # To ADD: Masking.
 
@@ -31,7 +33,11 @@ import numba
 class MaddnessUtils():
     def __init__(self, C=16):
         self.C = C
+        self.luts = None
 
+    def set_lut(self, luts):
+        self.luts = luts
+        
     def learn_hash_buckets_and_prototypes(self, A):
         _, D = A.shape
         if D < self.C:
@@ -96,9 +102,9 @@ def construct_sparse_embedding(weight: np.ndarray, weight_enc: np.ndarray, C: in
     
     _, embedding_dim = weight.shape
     STEP = embedding_dim // C
-    out_luts = np.ndarray((C, K, K), dtype=np.float32) # [NPrototype, ncentroid, ncentroid]
+    out_luts = np.zeros((C, K, K), dtype=np.float32) # [NPrototype, ncentroid, ncentroid]
 
-    for cth in range(0, C, STEP):
+    for cth in tqdm(range(0, C, STEP)):
         weight_c     = weight[:, cth:(cth+STEP)] # [vocab_size, STEP]
         weight_enc_c = weight_enc[:, cth//STEP]  # [vocab_size]
 
@@ -112,7 +118,7 @@ def construct_sparse_embedding(weight: np.ndarray, weight_enc: np.ndarray, C: in
         #
 
         # Should be computed with Circular Mean...
-        centroids_source = np.ndarray((K, STEP), dtype=np.float32) # Dot Product / sqrt(dim)
+        centroids_source = np.zeros((K, STEP), dtype=np.float32) # Dot Product / sqrt(dim)
         #centroids_target = np.ndarray((K, STEP), dtype=np.float32) # Dot Product / sqrt(dim)
 
         # Binary_Tree_Loss = SSE
@@ -129,8 +135,38 @@ def construct_sparse_embedding(weight: np.ndarray, weight_enc: np.ndarray, C: in
                 target = centroids_source[target_kth, :]
                 
                 w = np.dot(source, target)
-                out_luts[cth, source_kth, target_kth] = w
+                out_luts[cth//STEP, source_kth, target_kth] = w
     return out_luts
+
+@numba.jit(nopython=True, parallel=True)
+def aggregate_enc(A_enc: np.ndarray, B_enc: np.ndarray, luts: np.ndarray):
+    """
+    A_enc [seq_len1, C]
+    B_enc [seq_len2, C]
+
+    luts [C, K, K]
+
+    return
+      - [seq_len1, seq_len2]
+    """
+    
+    seq_len1 = A_enc.shape[0]
+    seq_len2 = B_enc.shape[0]
+
+    out = np.zeros((seq_len1, seq_len2), dtype=np.float32)
+    C = A_enc.shape[1]
+
+    for cth in prange(C):
+        # Iteration By Prototypes
+        A_enc_c = A_enc[:, cth] # TODO: Column-major
+        B_enc_c = B_enc[:, cth] # TODO: Column-major
+
+        for source_i in range(seq_len1):
+            for target_i in range(seq_len2):
+                out[source_i, target_i] += luts[cth, A_enc_c[source_i], B_enc_c[target_i]]
+
+    return out
+    
 
 class SparseMatmul3dNode(torch.autograd.Function):
     @staticmethod
@@ -150,6 +186,8 @@ class SparseMatmul3D(nn.Module):
     def __init__(self, encoder):
         super(SparseMatmul3D, self).__init__()
         self.encoder = encoder
+        self.maddness = encoder.maddness
+        self.diff = encoder.diffusion
 
     def forward(self, x, y):
         """
@@ -157,6 +195,13 @@ class SparseMatmul3D(nn.Module):
           x - [batch_size, N, D]
           y - [batch_size, M, D]
         """
+
+        luts = self.maddness.luts
+        A_enc = self.diff.encode_state(x)
+        B_enc = self.diff.encode_state(y)
+
+        out = aggregate_enc(A_enc[0], B_enc[0], luts)
+        print(out)
         if self.encoder.config.opt_forward:
             return SparseMatmul3dNode.apply(x, y.transpose(-2, -1), self.encoder)
         else:
@@ -195,11 +240,7 @@ class SaltEmbedding(nn.Module):
         luts = construct_sparse_embedding(self.embedding.weight.to('cpu').detach().numpy(),
                                           weight_enc[0],
                                           self.C)
-        # Obtain LSH, and each centroids.
-        # headsごとに学習?
-        #
-        #
-        # Encoding時にMHAを考慮するの忘れない (when adding offset)
+        self.maddness.set_lut(luts)
 
     def forward(self, x):
         """
