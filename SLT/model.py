@@ -3,7 +3,10 @@ import torch
 import torch.nn as nn
 
 from .maddness_legacy import (
-    MaddnessMatmul
+    halut_encode_opt,
+    MultiSplit,
+    learn_proto_and_hash_function,
+    split_lists_to_numpy
 )
 
 import numpy as np
@@ -13,16 +16,40 @@ import math
 import pickle
 import os
 
+from tqdm import tqdm
+import numba
 # Saltの各層で、Embedding <-> LUTの復元の時、分布をalpha*x+betaで復元する。(微分可能にはしない)
 # To ADD: Masking.
 
 # TODO LIST:
 
 # 1. SparseMatmul3D (Forward Backward)
-# 2. Pickle Trained Maddness Class
+# 2. Pickle Trained Maddness Class (Done)
 # 3. Embedding層の分布の共通化, 復元の誤差を計測
 # 4. Fine Tuning (What Layer is needed and What Layer is not needed.)
 
+class MaddnessUtils():
+    def __init__(self, C=16):
+        self.C = C
+
+    def learn_hash_buckets_and_prototypes(self, A):
+        _, D = A.shape
+        if D < self.C:
+            raise Exception("D < C: {} < {}".format(D, self.C))
+        self.splits_lists, self.prototypes, _ = learn_proto_and_hash_function(
+            A, self.C, lut_work_const=1 # No Prototype optimizing.
+        )
+
+        self.ret_array, _, _ = split_lists_to_numpy(self.splits_lists)
+
+    def save_model(self, path):
+        with open(path, "wb") as f:
+            pickle.dump([self.ret_array], f)
+
+    def restore_model(self, path):
+        with open(path, "rb") as f:
+            self.ret_array, = pickle.load(f)
+        
 class SaltConfig():
     def __init__(self,
                  embedding_dim=784,
@@ -36,6 +63,8 @@ class SaltConfig():
                  use_embedding=None,
                  positional_encoder="orthogonal",
                  maddness_save_path="./maddness_tmp.pickle",
+                 opt_forward=True,
+                 opt_backward=True,
                  dropout=None,
                  maddness=True):
         
@@ -54,33 +83,91 @@ class SaltConfig():
         self.layer_norm_eps= layer_norm_eps
         self.dim_ffn = dim_ffn
         self.maddness_save_path = maddness_save_path
-        
+        self.opt_forward = opt_forward
+        self.opt_backward = opt_backward
 
-# Temporary
-# __init__使えますか?
-"""
-class SparseMatmul4D(nn.autograd.Function):
-    def __init__(self, salt_embedding):
-        self.salt_embedding = salt_embedding
+def construct_sparse_embedding(weight: np.ndarray, weight_enc: np.ndarray, C: int, K:int = 16):
+    """
+    weight     [vocab_size, embedding_dim]
+    weight_enc [vocab_size, dim//C]
+    """
 
+    #assert weight.dims() == 2 and weight_enc.dims() == 2
+    
+    _, embedding_dim = weight.shape
+    STEP = embedding_dim // C
+    out_luts = np.ndarray((C, K, K), dtype=np.float32) # [NPrototype, ncentroid, ncentroid]
+
+    for cth in range(0, C, STEP):
+        weight_c     = weight[:, cth:(cth+STEP)] # [vocab_size, STEP]
+        weight_enc_c = weight_enc[:, cth//STEP]  # [vocab_size]
+
+        # Aggregate = Geometric Mean
+
+        #
+        #     1 2 3 
+        #   1 1 2 3
+        #   2 2 4 6
+        #   3 3 6 9 <- TODO: Remove duplicates for memory-efficiency, but for simplicity, ignore it for a while.
+        #
+
+        # Should be computed with Circular Mean...
+        centroids_source = np.ndarray((K, STEP), dtype=np.float32) # Dot Product / sqrt(dim)
+        #centroids_target = np.ndarray((K, STEP), dtype=np.float32) # Dot Product / sqrt(dim)
+
+        # Binary_Tree_Loss = SSE
+        for kth in range(K):
+            kplace = np.where(weight_enc_c == kth, True, False)
+            k_cluster_weights = weight_c[kplace, :] # [:, STEP]
+            centroids_source[kth] = k_cluster_weights.mean(axis=0)
+
+        # Optimize Protos? Or compute loss by any measure?
+
+        for source_kth in range(K):
+            for target_kth in range(K):
+                source = centroids_source[source_kth, :]
+                target = centroids_source[target_kth, :]
+                
+                w = np.dot(source, target)
+                out_luts[cth, source_kth, target_kth] = w
+    return out_luts
+
+class SparseMatmul3dNode(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, y, encoder=None):
-        # forwardはMaddnessで、backwardは通常に？
-        ctx.save_for_backward(x)
-        ctx.save_for_backward(y)
-        return torch.matmul(x, y.T)
+    def forward(x, y, encoder=None):
+        return torch.matmul(x, y)
+    @staticmethod
+    def setup_context(ctx, inputs, outputs):
+        x, y, _ = inputs
+        ctx.save_for_backward(x, y)
 
     @staticmethod
     def backward(ctx, dy):
-        return torch.matmul(ctx.x, dy), torch.matmul(dy, ctx.y), None
-"""
+        x, y = ctx.saved_tensors
+        return torch.matmul(dy, y.transpose(-2, -1)), torch.matmul(x.transpose(-1, -2), dy), None
 
+class SparseMatmul3D(nn.Module):
+    def __init__(self, encoder):
+        super(SparseMatmul3D, self).__init__()
+        self.encoder = encoder
+
+    def forward(self, x, y):
+        """
+        Input:
+          x - [batch_size, N, D]
+          y - [batch_size, M, D]
+        """
+        if self.encoder.config.opt_forward:
+            return SparseMatmul3dNode.apply(x, y.transpose(-2, -1), self.encoder)
+        else:
+            return torch.matmul(x, y.transpose(-2, -1))
+    
 class SaltEmbedding(nn.Module):
     def __init__(self, config: SaltConfig):
         super(SaltEmbedding, self).__init__()
         self.embedding = nn.Embedding(config.vocab_size, config.embedding_dim, padding_idx=config.pad_idx)
         self.C         = config.C * config.nheads
-        self.maddness  = MaddnessMatmul(C=self.C)
+        self.maddness  = MaddnessUtils(C=self.C)
         self.config    = config
 
         if config.use_embedding is not None:
@@ -89,20 +176,25 @@ class SaltEmbedding(nn.Module):
         self.optimize_embedding()
 
     def load_embedding(self, x):
+        print(f"Vocab_Size: {x.size(0)} Embedding_dim: {x.size(1)}")
         self.embedding.weight = nn.Parameter(x)
 
     def optimize_embedding(self):
         if os.path.exists(self.config.maddness_save_path):
             print(f"Resumption from {self.config.maddness_save_path}")
-            with open(self.config.maddness_save_path, 'rb') as f:
-                self.maddness = pickle.load(f)
+            self.maddness.restore_model(self.config.maddness_save_path)
         else:
             print(f"Constructing binary-tree-splits and LUTs for Embedding.")
-            self.maddness._learn_hash_buckets_and_prototypes(self.embedding.weight.detach().numpy()) # Adding Noises To Increase vocab. ?
-            self.maddness._set_B(self.embedding.weight.detach().numpy().T)
-            with open(self.config.maddness_save_path, 'wb') as f:
-                pickle.dump(self.maddness, f)
+            self.maddness.learn_hash_buckets_and_prototypes(self.embedding.weight.detach().numpy()) # Adding noise?
+            self.maddness.save_model(self.config.maddness_save_path)
             print(f"The result is saved at {self.config.maddness_save_path}")
+
+        # 後で：Save
+        self.diffusion = IndexingDiffusion(self)
+        weight_enc = self.diffusion.encode_state(self.embedding.weight.detach().unsqueeze(0))
+        luts = construct_sparse_embedding(self.embedding.weight.to('cpu').detach().numpy(),
+                                          weight_enc[0],
+                                          self.C)
         # Obtain LSH, and each centroids.
         # headsごとに学習?
         #
@@ -114,7 +206,34 @@ class SaltEmbedding(nn.Module):
         Return:
           Embeddings - [batch_size, sentence_length, embedding_dim] (no positional encoding)
         """
-        return self.embedding(x)
+        out = self.embedding(x)
+        return out
+    
+class IndexingDiffusion():
+    def __init__(self, embedding: SaltEmbedding):
+        self.maddness  = embedding.maddness
+        self.embedding = embedding
+
+    def encode_state(self, x: torch.Tensor) -> np.ndarray:
+        """
+        Encodes x (torch.Tensor) [batch_size, seq_len, dim] into out (np.ndarray, np.uint8)[batch_size, seq_len, dim // (C * nheads)]
+        """
+        out = np.zeros((x.size(0), x.size(1), self.maddness.C), dtype=np.uint32) #Column-Major [Batch-Size, STEP, N]
+
+        # offsets = [0, 1, 2, 3, ...]
+        #offsets = np.arange(self.maddness.C) * 16
+        
+        for n_batch in range(x.size(0)):
+            out[n_batch] = halut_encode_opt(x[n_batch].to('cpu').detach().numpy(), self.maddness.ret_array)# + offsets
+
+        # MaddnessHash: Loss -> Cumulative_CosSim
+        # dim=784, nheads=8, C=7 (expt 16 14) = 72057594037927936
+        # 同一のプロトタイプにのみLUTを構築する
+        # P1 ... 16 * 16 = 256
+        # P2 ... 16 * 16 = 256
+        #        ...
+        # LUT's size is that: 256 * C = 14336.
+        return out
 
 
 def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
@@ -159,7 +278,9 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
         #  I have a new pen ... vs  So, Do, I, I[t+1], I[t+2],     ...
         #
         # t=0~t=current_processing_time = accumlated in cumulative_context. and being reused.
-        #
+        # Todo: Mask Target When Training.
+        # Todo: When Inferencing, Salt doesn't have to wait until the t+1 word predicted.
+        # So looping Salt until the result gets enough good.
         # The total result is normalized
 
         # should cumulative_context be trainable? (k.weight works as initial-weight i guess)
@@ -218,7 +339,7 @@ def merge_attn(positional_encoder,
         q_n = q[:, nth_head, :, :]
         k_n = k[:, nth_head, :, :]
         
-        return torch.matmul(q_n, k_n.transpose(-2, -1)).unsqueeze(dim=1) #SparseMatmul3D()(q_n, k_n) # The equivalent to q_n @ k_n.T, returing [batch_size, 1, seq_len, seq_len]
+        return SparseMatmul3D(salt_embedding)(q_n, k_n).unsqueeze(dim=1) #SparseMatmul3D()(q_n, k_n) # The equivalent to q_n @ k_n.T, returing [batch_size, 1, seq_len, seq_len]
     
     # Compute with Maddness(Sparse)
     semantic_w = torch.concat([apply_semantic_attn(nth_head) for nth_head in range(q.size(1))], dim=1) / 100.0 # [batch_size, nheads, seq_len, seq_len]
@@ -231,6 +352,8 @@ def merge_attn(positional_encoder,
     # avoid unexcepted broadcasting
     assert semantic_w.shape == grammar_w.shape
     # Ensembling
+
+    # Note: semantic_w, grammar_wにLinearを通す必要があると思う。 (Q_W, K_Wを廃止する代わりに), MHAに入力するsource/targetはいつでもEmbeddingに復元できるように
     return nn.Softmax(dim=-1)((alpha * semantic_w + beta * grammar_w) / gamma)
 
 class SaltMHA(nn.Module):
@@ -353,14 +476,15 @@ class SaltGPT(nn.Module):
 # TODO: Pickle maddness
 def test():
     config = SaltConfig(nlayers=2, dim_ffn=128)
-    weights = torch.load('./gpt2-pytorch_model.bin', map_location='cpu' if not torch.cuda.is_available() else None)['wte.weight']
-    config.use_embedding = weights
-    config.vocab_size = weights.size()[0]
-    config.embedding_dim = weights.size()[1]
+    #weights = torch.load('./gpt2-pytorch_model.bin', map_location='cpu' if not torch.cuda.is_available() else None)['wte.weight']
+    #config.use_embedding = weights
+    config.maddness_save_path = "./tmp1.pickle"
+    #config.vocab_size = weights.size()[0]
+    #config.embedding_dim = weights.size()[1]
     model  = SaltGPT(config)
     #model = torch.compile(model)
-    x = torch.randint(0, config.vocab_size, (1, 300))
-    y = torch.randint(0, config.vocab_size, (1, 300))
+    x = torch.randint(0, config.vocab_size, (3, 300))
+    y = torch.randint(0, config.vocab_size, (3, 300))
     out = model(x, y)
     print(torch.argmax(out, dim=-1))
     print(out.shape)

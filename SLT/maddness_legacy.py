@@ -828,18 +828,19 @@ def learn_proto_and_hash_function(
         f"After Ridge regression {X.shape}-{C}-{K}"
         f"({(ram_usage / (1024 * 1024)):.3f} GB)"
     )
-    report_array = np.array(
-        [
-            mse_error,
-            msv_orig,
-            mse_error / msv_orig,
-            np.mean(X_orig),
-            mse_res,
-            mse_res / msv_orig,
-            ram_usage / (1024 * 1024),
-        ]
-    )
-    return all_splits, all_prototypes, report_array
+    
+    #report_array = np.array(
+    #    [
+    #        mse_error,
+    #        msv_orig,
+    #        mse_error / msv_orig,
+    #        np.mean(X_orig),
+    #        mse_res,
+    #        mse_res / msv_orig,
+    #        ram_usage / (1024 * 1024),
+    #    ]
+    #)
+    return all_splits, all_prototypes, None#report_array
 
 def maddness_lut(q: np.ndarray, all_prototypes: np.ndarray) -> np.ndarray:
     q = q.reshape(1, 1, -1)  # all_prototypes is shape C, K, D
@@ -989,14 +990,15 @@ class MaddnessMatmul:
         self.K = 16
         self.A_enc: Optional[np.ndarray] = None
         self.luts: Optional[np.ndarray] = None
-
+        
         self.quantize_lut = True
         self.upcast_every = 16
         self.upcast_every = min(self.C, self.upcast_every)
         # important otherwise wrong summation
         assert self.upcast_every in (1, 2, 4, 8, 16, 32, 64, 128, 256)
         self.accumulate_how = "mean"  # sum
-
+        
+        
     def _learn_hash_buckets_and_prototypes(self, A: np.ndarray) -> None:
         _, D = A.shape
         if D < self.C:
@@ -1100,7 +1102,7 @@ class MaddnessMatmul:
         # lookups given encoded data + luts
         nlookups = N * M * self.C
         print("nmuls: ", nmuls, "KEY_NLOOKUPS:", nlookups)
-        
+    
 
 if __name__ == "__main__":
     def train(
