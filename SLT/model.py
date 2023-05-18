@@ -20,16 +20,6 @@ from tqdm import tqdm
 import numba
 from numba import prange
 
-# Saltの各層で、Embedding <-> LUTの復元の時、分布をalpha*x+betaで復元する。(微分可能にはしない)
-# To ADD: Masking.
-
-# TODO LIST:
-
-# 1. SparseMatmul3D (Forward Backward)
-# 2. Pickle Trained Maddness Class (Done)
-# 3. Embedding層の分布の共通化, 復元の誤差を計測
-# 4. Fine Tuning (What Layer is needed and What Layer is not needed.)
-
 class MaddnessUtils():
     def __init__(self, C=16):
         self.C = C
@@ -175,6 +165,7 @@ class SparseMatmul3dNode(torch.autograd.Function):
     def forward(x, y, encoder=None):
         # Encoder = SaltEmbedding
 
+        # if not using maddness, this node is residual. so how's using uint8 only here.
         #out = torch.matmul(x, y.transpose(-2, -1))
         A_enc = encoder.diffusion.encode_state(x)
         B_enc = encoder.diffusion.encode_state(y)
@@ -237,7 +228,6 @@ class SaltEmbedding(nn.Module):
             self.maddness.save_model(self.config.maddness_save_path)
             print(f"The result is saved at {self.config.maddness_save_path}")
 
-        # 後で：Save
         self.diffusion = IndexingDiffusion(self)
         weight_enc = self.diffusion.encode_state(self.embedding.weight.detach().unsqueeze(0))
         luts = construct_sparse_embedding(self.embedding.weight.to('cpu').detach().numpy(),
@@ -265,7 +255,7 @@ class IndexingDiffusion():
         out = np.zeros((x.size(0), x.size(1), self.maddness.C), dtype=np.uint32) #Column-Major [Batch-Size, STEP, N]
 
         # offsets = [0, 1, 2, 3, ...]
-        #offsets = np.arange(self.maddness.C) * 16
+        # offsets = np.arange(self.maddness.C) * 16
         
         for n_batch in range(x.size(0)):
             out[n_batch] = halut_encode_opt(x[n_batch].to('cpu').detach().numpy(), self.maddness.ret_array)# + offsets
@@ -287,7 +277,7 @@ class IndexingDiffusion():
         return torch.from_numpy(out)
 
 
-def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
+def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.05):
     """
     To -> (RNN) -> To+1 -> To+2 ...
 
@@ -340,11 +330,14 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
         cumulative_context = torch.zeros((kn.size(0), 1, kn.size(-1))) # [batch_size, 1, embedding_dim//nheads]
         cumulative_context += kn[:, 0, :].unsqueeze(1)
 
-        for t in range(0, whole_time):
+        out = torch.matmul(qn, cumulative_context.transpose(-2, -1))
+        w_ret.append(out)
+
+        for t in range(1, whole_time):
             # Here, we predict Words t=n+1 from t=n and compute matmul.
             # [batch_size, time, embedding_dim//nheads] @ [batch_size, 1, embedding_dim//nheads].T
 
-            # is it ok?
+            # get cumulative_context[t+1]
             cumulative_context = nn.Tanh()(
                 torch.mul(cumulative_context, pe_w) # [1 dim] * [1 dim] -> [1 dim]. t=0~t-1, * weight, (Q. Add bias?)
             )
@@ -353,9 +346,11 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
             # qn [batch_size, time, dim] @ cumulative_context[batch_size, 1, dim].T
             out = torch.matmul(qn, cumulative_context.transpose(-2, -1)) # w_t = [batch_size, time, 1]
             w_ret.append(out)
-            # print(cosine_simirality(kn[:, t, :], cumulative_context)
+
+            #print(np.matmul(kn[:, t, :].detach().numpy(), cumulative_context.detach().numpy().transpose(-2, -1)))
+            
             # Update cumulative_context for next iteration
-            cumulative_context = torch.mul(kn[:, t, :].unsqueeze(1), cumulative_context * (1.0 - decay_rate))
+            cumulative_context = nn.Tanh()(torch.mul(kn[:, t, :].unsqueeze(1), cumulative_context * (1.0 - decay_rate)))
             # torch.concat(w_ret, dim=-1) -> [batch_size, time, time]
             # unsqueeze it -> [batch_size, 1, time, time]
         return torch.concat(w_ret, dim=-1).unsqueeze(dim=1) / math.sqrt(q.size(-1)) # Return: [batch_size, 1, time]
@@ -424,6 +419,9 @@ class SaltMHA(nn.Module):
 
         self.W_s = nn.SiLU()
         self.W_g = nn.SiLU()
+        size = config.embedding_dim // config.nheads
+        self.W_v = nn.Parameter(nn.init.orthogonal_(
+            torch.empty(1, config.nheads, size, size), gain=1))
         
     def split_heads(self, x):
         """
@@ -448,6 +446,8 @@ class SaltMHA(nn.Module):
         q = self.split_heads(source)
         k = self.split_heads(target)
         v = self.split_heads(target)
+
+        v = torch.matmul(v, self.W_v)
         
         # Reconstruct Q, K?
         

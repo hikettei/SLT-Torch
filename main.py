@@ -56,7 +56,7 @@ a novel understanding of learning contextual representations of a sentence using
 the feature (a.k.a, embedding) of words in a sequence can be considered as the initial positions of a
 collection of particles, and the latent representations abstracted in stacked Transformer layers can be
 viewed as the location of particles moving in a high-dimensional space at different time points
-"""
+""".replace("\n", "")
 
 target = """[BOS]
 Such an interpretation not only provides a new perspective on the Transformer but also inspires us
@@ -74,7 +74,7 @@ We conduct extensive experiments on both supervised and unsupervised learning ta
 we replace Transformer layers by Macaron layers and keep the number of parameters to be the same.
 Experiments show that the Macaron Net can achieve higher accuracy than the Transformer on all
 tasks which, in a way, is consistent with the ODE theory.
-"""
+""".replace("\n", "")
 
 
 bpe_tokenizer = encoder.get_encoder()
