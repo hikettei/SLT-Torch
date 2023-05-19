@@ -43,19 +43,10 @@ config.use_embedding = weights
 config.vocab_size = weights.size()[0]
 config.embedding_dim = weights.size()[1]
 
-source = """[BOS]Sapporo[a] (札幌市, Sapporo-shi, IPA: [sapːoɾo ɕi]) (Ainu: サッ・ポロ・ペッ, romanized: Satporopet, lit. 'Dry, Great River')[2] is a city in Japan. It is the largest city north of Tokyo and the largest city on Hokkaido, the northernmost main island of the country. It ranks as the fifth most populous city in Japan. It is the capital city of Hokkaido Prefecture and Ishikari Subprefecture. Sapporo lies in the southwest of Hokkaido, within the alluvial fan of the Toyohira River, which is a tributary stream of the Ishikari. It is considered the cultural, economic, and political center of Hokkaido.
+source = """[BOS]Sapporo[a] (札幌市, Sapporo-shi, IPA: [sapːoɾo ɕi]) (Ainu: サッ・ポロ・ペッ, romanized: Satporopet, lit. 'Dry, Great River')[2] is a city in Japan. It is the largest city north of Tokyo and the largest city on Hokkaido, the northernmost main island of the country. It ranks as the fifth most populous city in Japan. It is the capital city of Hokkaido Prefecture and Ishikari Subprefecture. Sapporo lies in the southwest of Hokkaido, within the alluvial fan of the Toyohira River, which is a tributary stream of the Ishikari. It is considered the cultural, economic, and political center of Hokkaido.As with most of Hokkaido, the Sapporo area was settled by the indigenous Ainu people, beginning over 15,000 years ago. Starting in the late 19th century, Sapporo saw increasing settlement by Yamato migrants. Sapporo hosted the 1972 Winter Olympics, the first Winter Olympics ever held in Asia, and the second Olympic games held in Japan after the 1964 Summer Olympics. Sapporo is currently bidding for the 2030 Winter Olympics.[3] The Sapporo Dome hosted three games during the 2002 FIFA World Cup and two games during the 2019 Rugby World Cup. Additionally, Sapporo has hosted the Asian Winter Games three times, in 1986, 1990, and 2017 and the 1991 Winter Universiade.The annual Sapporo Snow Festival draws more than 2 million tourists from abroad.[4] Other notable sites include the Sapporo Beer Museum, which is the only beer museum in Japan,[5] and the Sapporo TV Tower located in Odori Park. It is home to Hokkaido University, just north of Sapporo Station. The city is served by Okadama Airport and New Chitose Airport in nearby Chitose.
+""".replace("\n", "[SEP]").replace(".", "[BOS]")
 
-As with most of Hokkaido, the Sapporo area was settled by the indigenous Ainu people, beginning over 15,000 years ago. Starting in the late 19th century, Sapporo saw increasing settlement by Yamato migrants. Sapporo hosted the 1972 Winter Olympics, the first Winter Olympics ever held in Asia, and the second Olympic games held in Japan after the 1964 Summer Olympics. Sapporo is currently bidding for the 2030 Winter Olympics.[3] The Sapporo Dome hosted three games during the 2002 FIFA World Cup and two games during the 2019 Rugby World Cup. Additionally, Sapporo has hosted the Asian Winter Games three times, in 1986, 1990, and 2017 and the 1991 Winter Universiade.
-
-The annual Sapporo Snow Festival draws more than 2 million tourists from abroad.[4] Other notable sites include the Sapporo Beer Museum, which is the only beer museum in Japan,[5] and the Sapporo TV Tower located in Odori Park. It is home to Hokkaido University, just north of Sapporo Station. The city is served by Okadama Airport and New Chitose Airport in nearby Chitose.
-""".replace("\n", "[SEP]").replace(".", "[SEP]")
-
-target = """[BOS]Sapporo[a] (札幌市, Sapporo-shi, IPA: [sapːoɾo ɕi]) (Ainu: サッ・ポロ・ペッ, romanized: Satporopet, lit. 'Dry, Great River')[2] is a city in Japan. It is the largest city north of Tokyo and the largest city on Hokkaido, the northernmost main island of the country. It ranks as the fifth most populous city in Japan. It is the capital city of Hokkaido Prefecture and Ishikari Subprefecture. Sapporo lies in the southwest of Hokkaido, within the alluvial fan of the Toyohira River, which is a tributary stream of the Ishikari. It is considered the cultural, economic, and political center of Hokkaido.
-
-As with most of Hokkaido, the Sapporo area was settled by the indigenous Ainu people, beginning over 15,000 years ago. Starting in the late 19th century, Sapporo saw increasing settlement by Yamato migrants. Sapporo hosted the 1972 Winter Olympics, the first Winter Olympics ever held in Asia, and the second Olympic games held in Japan after the 1964 Summer Olympics. Sapporo is currently bidding for the 2030 Winter Olympics.[3] The Sapporo Dome hosted three games during the 2002 FIFA World Cup and two games during the 2019 Rugby World Cup. Additionally, Sapporo has hosted the Asian Winter Games three times, in 1986, 1990, and 2017 and the 1991 Winter Universiade.
-
-The annual Sapporo Snow Festival draws more than 2 million tourists from abroad.[4] Other notable sites include the Sapporo Beer Museum, which is the only beer museum in Japan,[5] and the Sapporo TV Tower located in Odori Park. It is home to Hokkaido University, just north of Sapporo Station. The city is served by Okadama Airport and New Chitose Airport in nearby Chitose.
-""".replace("\n", "[SEP]").replace(".", "[SEP]")
+target = source
 
 start_sentence = """[BOS]"""
 
@@ -85,14 +76,14 @@ def train(config, model, optimizer, x, y):
     optimizer.zero_grad()
     y_out = step_model(config, model, x, start)
     loss = 0.0
-    for n in range(y.size(1)-1):
-        loss += criterion(y_out[:, n, :], y[:, n-1])
+    for n in range(5):#range(y.size(1)-1):
+        loss += criterion(y_out[:, n, :], y[:, n+1])
     loss.backward()
     print(f"loss: {loss / y.size(1)}")
     optimizer.step()
     generate_sentence(config, model, "[BOS]Sapporo is a city")
 
-def generate_sentence(config, model, source, input_more="The answer is that:", sentence_len=50):
+def generate_sentence(config, model, source, input_more="", sentence_len=50):
     x_first = source
     y_first = "[BOS]" + input_more
     

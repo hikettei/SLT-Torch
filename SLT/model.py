@@ -339,13 +339,14 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
             # [batch_size, time, embedding_dim//nheads] @ [batch_size, 1, embedding_dim//nheads].T
 
             # get cumulative_context[t+1]
-            next_word, hidden_state = pe_w(kn[:, t, :].unsqueeze(1), hidden_state * (1.0 - decay_rate))
-            
+            next_word, hidden_state = pe_w(next_word, hidden_state)
             # cumulative_context = nn.Dropout()
             # qn [batch_size, time, dim] @ cumulative_context[batch_size, hidden_dim, dim]
-
+            
             out = torch.matmul(qn, next_word.transpose(-2, -1))
             w_ret.append(out)
+
+            next_word = nn.ReLU()(torch.mul(next_word, kn[:, t, :].unsqueeze(1)))
 
             #print(np.matmul(kn[:, t, :].detach().numpy(), cumulative_context.detach().numpy().transpose(-2, -1)))
             
@@ -429,10 +430,6 @@ class SaltMHA(nn.Module):
         self.dropoutq = nn.Dropout(config.dropout)
         self.dropoutk = nn.Dropout(config.dropout)
         self.dropoutv = nn.Dropout(config.dropout)
-        #self.W_k = nn.Parameter(nn.init.orthogonal_(
-        #    torch.empty(1, config.nheads, size, size), gain=1))
-        #self.W_q = nn.Parameter(nn.init.orthogonal_(
-        #    torch.empty(1, config.nheads, size, size), gain=1))
         
     def split_heads(self, x):
         """
@@ -459,12 +456,12 @@ class SaltMHA(nn.Module):
         v = self.split_heads(target)
 
         q = torch.matmul(q, self.W_q)
+        #k = torch.matmul(k, self.W_k)
         v = torch.matmul(v, self.W_v)
         
         q, k, v = self.dropoutq(q), self.dropoutk(k), self.dropoutv(v)
         
         w = merge_attn(self.encoder, self.salt_embedding, q, k, self.W_s, self.W_g)
-        # Global/LocalなAttentionは線形分離可能か？
         
         out = torch.matmul(w, v) # w <- word[0] * weight[0] + word[1] * weight[1] * ...
         return self.merge_heads(out)
@@ -513,6 +510,16 @@ class Block(nn.Module):
         self.dropout3 = nn.Dropout(config.dropout)
         
     def forward(self, x, y):
+        # Memo: Use it instead:
+        #
+        # y = y + 1/3FFN(LayerNorm(y))
+        # y_gr = GrammarAttn(x, y) <- ここで未来の情報をn-1からn方向に上書き
+        # y = y + 1/3FFN(LayerNorm(y + y_gr))
+        # y_se = MHA(x, y)
+        # y = y + 1/3FFN(LayerNorm(y + y_se))
+        #
+        
+        
         # Convection Step
         y = y + (0.5 * self.dropout1(self.ffn1(self.ln1(y)))) # Pre-LN
 
@@ -522,7 +529,7 @@ class Block(nn.Module):
         # Convection Step Again
         y = y + (0.5 * self.dropout3(self.ffn2(self.ln2(y + attn))))
         return y
-    
+
 class SaltGPT(nn.Module):
     def __init__(self, config):
         super(SaltGPT, self).__init__()
