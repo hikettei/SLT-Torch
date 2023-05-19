@@ -329,6 +329,9 @@ def time_attention(positional_encoder, salt_embedding, q, k, is_top=False, decay
         w_ret = [] # [[batch_size, time, 1] * time]
 
         next_word, hidden_state = pe_w(kn[:, 0, :].unsqueeze(1))
+        
+        if not is_top and kn.size(1) != 1:
+            next_word = kn[:, 1, :].unsqueeze(1)
 
         # [batch_size, whole_time, dim] @ [batch_size, 1, dim].T
         out = torch.matmul(qn, next_word.transpose(-2, -1))
@@ -345,14 +348,13 @@ def time_attention(positional_encoder, salt_embedding, q, k, is_top=False, decay
             
             out = torch.matmul(qn, next_word.transpose(-2, -1))
             w_ret.append(out)
-
-            if not is_top:
-                next_word = nn.Tanh()(torch.add(next_word, kn[:, t, :].unsqueeze(1)))
-
-            #print(np.matmul(kn[:, t, :].detach().numpy(), cumulative_context.detach().numpy().transpose(-2, -1)))
             
-        return torch.concat(w_ret, dim=-1).unsqueeze(dim=1) / math.sqrt(q.size(-1)) 
-        
+            if not is_top:
+                next_word = kn[:, t, :].unsqueeze(1) #nn.Tanh()(torch.add(next_word, kn[:, t, :].unsqueeze(1)))
+            
+            
+        return torch.concat(w_ret, dim=-1).unsqueeze(dim=1) / math.sqrt(q.size(-1))
+    
     time_weights = torch.concat([apply_time_attn(nth) for nth in range(q.size(1))], dim=1)
     
     # Return: [batch_size, nheads, time_q, time_k]
@@ -457,7 +459,6 @@ class SaltMHA(nn.Module):
         """
         Input: [batch_size, seq_len, embedding_dim]
         """
-        # TODO: Q, K, V
         
         q = self.split_heads(source)
         k = self.split_heads(target)
@@ -504,10 +505,10 @@ class FFN(nn.Module):
         return self.linear2(nn.functional.relu(self.linear1(x)))
     
 class Block(nn.Module):
-    def __init__(self, embedding_layer, config, is_top):
+    def __init__(self, embedding_layer, config, layer_n):
         super(Block, self).__init__()
-        self.rnn = SaltMHA(embedding_layer, config, is_top, attn_type="grammar")
-        self.mha = SaltMHA(embedding_layer, config, is_top, attn_type="semantic")
+        self.rnn = SaltMHA(embedding_layer, config, layer_n == 0, attn_type="grammar")
+        self.mha = SaltMHA(embedding_layer, config, layer_n == 0, attn_type="semantic")
         
         self.ln1 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
         self.ln2 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
@@ -521,34 +522,42 @@ class Block(nn.Module):
         self.dropout1 = nn.Dropout(config.dropout)
         self.dropout2 = nn.Dropout(config.dropout)
         self.dropout3 = nn.Dropout(config.dropout)
+
+        self.alpha = nn.Parameter(torch.tensor(1.0))
+        self.beta  = nn.Parameter(torch.tensor(1.0))
+        self.gamma = nn.Parameter(torch.tensor(1.0))
+
+        self.layer_n = layer_n
         
     def forward(self, x, y):
+        print(f"== Layer {self.layer_n} ================================")
+        print(f"{self.alpha.item()} -> {self.beta.item()} -> {self.gamma.item()}")
         
         # Convection Step
-        y = y + (1/2) * self.dropout1(self.ffn1(self.ln1(y)))
+        y = y + self.alpha * self.dropout1(self.ffn1(self.ln1(y)))
 
         # Diffusion Step
         y_attn = self.rnn(x, y)
         
         # Convection Step
-        y = y + (1/2) * self.dropout2(self.ffn2(self.ln2(y_attn + y)))
+        y = y + self.beta * self.dropout2(self.ffn2(self.ln2(y_attn + y)))
 
         # Diffusion Step
         y_attn = self.mha(x, y)
         
-        y = y + (1/2) * self.dropout3(self.ffn3(self.ln3(y_attn + y)))
+        y = y + self.gamma * self.dropout3(self.ffn3(self.ln3(y_attn + y)))
         return y
 
 class SaltGPT(nn.Module):
     def __init__(self, config):
         super(SaltGPT, self).__init__()
         self.embedding = SaltEmbedding(config)
-        self.layers = nn.ModuleList([Block(self.embedding, config, i == 0) for i in range(config.nlayers)])
+        self.layers = nn.ModuleList([Block(self.embedding, config, i) for i in range(config.nlayers)])
         self.linear_out = nn.Linear(config.embedding_dim, config.vocab_size)
 
     def forward(self, x, y, y_past=None, is_last=False):
-        x_emb = self.embedding(x)
-        y_emb = self.embedding(y) if y_past is None else y_past
+        x_emb   = self.embedding(x)
+        y_emb   = self.embedding(y) if y_past is None else y_past
 
         for layer in self.layers:
             y_emb = layer(x_emb, y_emb)
