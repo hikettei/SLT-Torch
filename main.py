@@ -35,7 +35,7 @@ def padding(x, y):
 config = SaltConfig(opt_forward=False,
                     opt_backward=False,
                     nlayers=3,
-                    dim_ffn=128,
+                    dim_ffn=1024,
                     diffusion_step=1)
 
 weights = torch.load('./gpt2-pytorch_model.bin', map_location='cpu' if not torch.cuda.is_available() else None)['wte.weight']
@@ -53,7 +53,7 @@ start_sentence = """[BOS]"""
 bpe_tokenizer = encoder.get_encoder()
 
 model  = SaltGPT(config)
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
 criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
 x_sentence = bpe_tokenizer.encode(source)
@@ -109,15 +109,14 @@ def generate_sentence(config, model, source, input_more="", sentence_len=50):
         print(bpe_tokenizer.decode(y_decode[0].tolist()))
 
 generate_sentence(config, model, "[BOS] Sapporo is")
-    
 
-use_len = 5
+use_len = 3
 
 for i in tqdm(range(1000)):
     loss_result = train(config, model, optimizer, x, y, use_len)
 
     if loss_result <= 3.0:
-        use_len += 5
+        use_len += 3
 
 
 while True:

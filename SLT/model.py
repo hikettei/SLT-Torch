@@ -418,7 +418,7 @@ class SaltMHA(nn.Module):
             if config.positional_encoder == "orthogonal":
                 size = config.embedding_dim // config.nheads
                 self.encoder = nn.ModuleList([
-                    nn.RNN(size, size, batch_first=True) for i in range(config.nheads)
+                    nn.GRU(size, size, batch_first=True) for i in range(config.nheads)
                 ])
             else:
                 raise Exception("Choose config.positional_encoder from: orthogonal")
