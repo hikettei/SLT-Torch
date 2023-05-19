@@ -76,10 +76,13 @@ def train(config, model, optimizer, x, y):
     optimizer.zero_grad()
     y_out = step_model(config, model, x, start)
     loss = 0.0
-    for n in range(5):#range(y.size(1)-1):
+
+    use_len = 5
+    
+    for n in range(use_len):#range(y.size(1)-1):
         loss += criterion(y_out[:, n, :], y[:, n+1])
     loss.backward()
-    print(f"loss: {loss / y.size(1)}")
+    print(f"loss: {loss / use_len}")
     optimizer.step()
     generate_sentence(config, model, "[BOS]Sapporo is a city")
 

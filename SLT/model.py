@@ -345,8 +345,8 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
             
             out = torch.matmul(qn, next_word.transpose(-2, -1))
             w_ret.append(out)
-
-            next_word = nn.ReLU()(torch.mul(next_word, kn[:, t, :].unsqueeze(1)))
+            
+            #next_word = nn.ReLU()(torch.mul(next_word, kn[:, t, :].unsqueeze(1)))
 
             #print(np.matmul(kn[:, t, :].detach().numpy(), cumulative_context.detach().numpy().transpose(-2, -1)))
             
@@ -360,8 +360,7 @@ def merge_attn(positional_encoder,
                salt_embedding,
                q,
                k,
-               W_s,
-               W_g):
+               state):
     """
     Merge Attentions:
       1. Semantical Attention. Just computing matmul with no positional embedded embeddings.
@@ -382,54 +381,60 @@ def merge_attn(positional_encoder,
         k_n = k[:, nth_head, :, :]
         
         return SparseMatmul3D(salt_embedding)(q_n, k_n).unsqueeze(dim=1) / math.sqrt(q_n.size(-1)) # The equivalent to q_n @ k_n.T, returing [batch_size, 1, seq_len, seq_len]
+
+    assert state in ("semantic", "grammar")
     
-    # Compute with Maddness(Sparse)
-    semantic_w = torch.concat([apply_semantic_attn(nth_head) for nth_head in range(q.size(1))], dim=1) # / 100.0  # [batch_size, nheads, seq_len, seq_len]
-
-    # Attention by Time.
-    grammar_w  = time_attention(positional_encoder, salt_embedding, q, k)
-
-    # what semantic_w to grammar_w is what Transformer to RNN. (merging global and super wide but low-precise attention, fast but small range attn)
-
+    if state == "semantic":
+        # Compute with Maddness(Sparse)
+        w = torch.concat([apply_semantic_attn(nth_head) for nth_head in range(q.size(1))], dim=1) # / 100.0  # [batch_size, nheads, seq_len, seq_len]
+    else:
+        # Attention by Time.
+        w  = time_attention(positional_encoder, salt_embedding, q, k)
+        
     # avoid unexcepted broadcasting
-    #assert semantic_w.shape == grammar_w.shape
-    
-    # Ensembling
-    #return nn.Softmax(dim=-1)(W_s(semantic_w) + W_g(grammar_w))
-
-    return nn.Softmax(dim=-1)(W_s(semantic_w) + W_g(grammar_w / math.sqrt(grammar_w.size(-1)))) / 2.0
+    return nn.Softmax(dim=-1)(w / math.sqrt(w.size(-1)))
 
 class SaltMHA(nn.Module):
-    def __init__(self, salt_embedding, config):
+    def __init__(self, salt_embedding, config, attn_type="semantic"):
         super(SaltMHA, self).__init__()
 
+        # SaltMHA has a two state of MHA:
+        # semantic ... MHA without PE
+        # grammar  ... MHA with RNN
+        
+        assert attn_type in ("semantic", "grammar")
+
+        self.state = attn_type
+        
         self.salt_embedding = salt_embedding
 
-        self.config = config
+        self.config        = config
         self.embedding_dim = config.embedding_dim
         self.nheads        = config.nheads
 
-        if config.positional_encoder == "orthogonal":
-            size = config.embedding_dim // config.nheads
-            self.encoder = nn.ModuleList([
-                nn.RNN(size, size, batch_first=True) for i in range(config.nheads)
-            ])
-        else:
-            raise Exception("Choose config.positional_encoder from: orthogonal")
-
-        self.W_s = nn.SiLU()
-        self.W_g = nn.SiLU()
         size = config.embedding_dim // config.nheads
         
-        self.W_q = nn.Parameter(nn.init.orthogonal_(
-            torch.empty(1, config.nheads, size, size), gain=1))
+        if attn_type == "grammar":
+            if config.positional_encoder == "orthogonal":
+                size = config.embedding_dim // config.nheads
+                self.encoder = nn.ModuleList([
+                    nn.RNN(size, size, batch_first=True) for i in range(config.nheads)
+                ])
+            else:
+                raise Exception("Choose config.positional_encoder from: orthogonal")
+        else:
+            self.encoder = None
+            self.W_k = nn.Parameter(torch.randn([1, config.nheads, size, size]) * math.sqrt(2 / size + size))
 
-        self.W_v = nn.Parameter(nn.init.orthogonal_(
-            torch.empty(1, config.nheads, size, size), gain=1))
+        self.W_q = nn.Parameter(torch.randn([1, config.nheads, size, size]) * math.sqrt(2 / size + size))
+        self.W_v = nn.Parameter(torch.randn([1, config.nheads, size, size]) * math.sqrt(2 / size + size))
 
+        self.W_o = nn.Parameter(torch.randn([1, config.nheads, size, size]) * math.sqrt(2 / size + size))
+        
         self.dropoutq = nn.Dropout(config.dropout)
         self.dropoutk = nn.Dropout(config.dropout)
         self.dropoutv = nn.Dropout(config.dropout)
+
         
     def split_heads(self, x):
         """
@@ -451,19 +456,24 @@ class SaltMHA(nn.Module):
         """
         # TODO: Q, K, V
         
-        q = self.split_heads(source)
-        k = self.split_heads(target)
+        q = self.split_heads(source)        
+        k = self.split_heads(target)    
         v = self.split_heads(target)
 
+        
         q = torch.matmul(q, self.W_q)
-        #k = torch.matmul(k, self.W_k)
+        if self.state == "semantic":
+            k = torch.matmul(k, self.W_k)
         v = torch.matmul(v, self.W_v)
         
         q, k, v = self.dropoutq(q), self.dropoutk(k), self.dropoutv(v)
-        
-        w = merge_attn(self.encoder, self.salt_embedding, q, k, self.W_s, self.W_g)
+
+        w = merge_attn(self.encoder, self.salt_embedding, q, k, self.state)
         
         out = torch.matmul(w, v) # w <- word[0] * weight[0] + word[1] * weight[1] * ...
+
+        out = torch.matmul(out, self.W_o)
+        # Out Lienar?
         return self.merge_heads(out)
 
 #Ref: https://github.com/graykode/gpt-2-Pytorch/blob/master/GPT2/model.py
@@ -499,35 +509,37 @@ class FFN(nn.Module):
 class Block(nn.Module):
     def __init__(self, embedding_layer, config):
         super(Block, self).__init__()
-        self.mha = SaltMHA(embedding_layer, config)
+        self.rnn = SaltMHA(embedding_layer, config, attn_type="grammar")
+        self.mha = SaltMHA(embedding_layer, config, attn_type="semantic")
+        
         self.ln1 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
         self.ln2 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
+        self.ln3 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
+        
         self.ffn1 = FFN(config.embedding_dim, config.dim_ffn)
         self.ffn2 = FFN(config.embedding_dim, config.dim_ffn)
+        self.ffn3 = FFN(config.embedding_dim, config.dim_ffn)
+        
 
         self.dropout1 = nn.Dropout(config.dropout)
         self.dropout2 = nn.Dropout(config.dropout)
         self.dropout3 = nn.Dropout(config.dropout)
         
     def forward(self, x, y):
-        # Memo: Use it instead:
-        #
-        # y = y + 1/3FFN(LayerNorm(y))
-        # y_gr = GrammarAttn(x, y) <- ここで未来の情報をn-1からn方向に上書き
-        # y = y + 1/3FFN(LayerNorm(y + y_gr))
-        # y_se = MHA(x, y)
-        # y = y + 1/3FFN(LayerNorm(y + y_se))
-        #
-        
         
         # Convection Step
-        y = y + (0.5 * self.dropout1(self.ffn1(self.ln1(y)))) # Pre-LN
+        y = y + (1/3) * self.dropout1(self.ffn1(self.ln1(y)))
 
         # Diffusion Step
-        attn = self.dropout2(self.mha(x, y))
+        y_attn = self.rnn(x, y)
 
-        # Convection Step Again
-        y = y + (0.5 * self.dropout3(self.ffn2(self.ln2(y + attn))))
+        # Convection Step
+        y = y + (1/3) * self.dropout2(self.ffn2(self.ln2(y_attn + y)))
+
+        # Diffusion Step
+        y_attn = self.mha(x, y)
+        
+        y = y + (1/3) * self.dropout3(self.ffn3(self.ln3(y_attn + y)))
         return y
 
 class SaltGPT(nn.Module):
