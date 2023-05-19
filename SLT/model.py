@@ -277,7 +277,7 @@ class IndexingDiffusion():
         return torch.from_numpy(out)
 
 
-def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
+def time_attention(positional_encoder, salt_embedding, q, k, is_top=False, decay_rate=0.0):
     """
     To -> (RNN) -> To+1 -> To+2 ...
 
@@ -299,7 +299,7 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
     positional_encoder [1, nheads, 1, embedding_dim//nheads]
     """
 
-    whole_time = q.size(2)
+    whole_time = k.size(2)
 
     def apply_time_attn(nth_head):
         qn = q[:, nth_head, :, :] # [batch_size, time, embedding_dim//nheads]
@@ -330,7 +330,7 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
 
         next_word, hidden_state = pe_w(kn[:, 0, :].unsqueeze(1))
 
-        # [batch_size, whole_time, dim] @ [batch_size, 1, dim]
+        # [batch_size, whole_time, dim] @ [batch_size, 1, dim].T
         out = torch.matmul(qn, next_word.transpose(-2, -1))
         w_ret.append(out)
 
@@ -345,22 +345,25 @@ def time_attention(positional_encoder, salt_embedding, q, k, decay_rate=0.0):
             
             out = torch.matmul(qn, next_word.transpose(-2, -1))
             w_ret.append(out)
-            
-            #next_word = nn.ReLU()(torch.mul(next_word, kn[:, t, :].unsqueeze(1)))
+
+            if not is_top:
+                next_word = nn.ReLU()(torch.mul(next_word, kn[:, t, :].unsqueeze(1)))
 
             #print(np.matmul(kn[:, t, :].detach().numpy(), cumulative_context.detach().numpy().transpose(-2, -1)))
             
-        return torch.concat(w_ret, dim=-1).unsqueeze(dim=1) / math.sqrt(q.size(-1)) # Return: [batch_size, 1, time]
+        return torch.concat(w_ret, dim=-1).unsqueeze(dim=1) / math.sqrt(q.size(-1)) 
         
     time_weights = torch.concat([apply_time_attn(nth) for nth in range(q.size(1))], dim=1)
-    # time_weights [batch_size, nheads, time]
-    return time_weights#nn.Softmax(dim=-1)(time_weights)
+    
+    # Return: [batch_size, nheads, time_q, time_k]
+    return time_weights
 
 def merge_attn(positional_encoder,
                salt_embedding,
                q,
                k,
-               state):
+               state,
+               is_top=False):
     """
     Merge Attentions:
       1. Semantical Attention. Just computing matmul with no positional embedded embeddings.
@@ -372,7 +375,7 @@ def merge_attn(positional_encoder,
       query   (Input Source) [batch_size, nheads, seq_len1, embedding_dim//nheads]
       keyword (Input Target) [batch_size, nheads, seq_len2, embedding_dim//nheads]
     """
-    assert q.size() == k.size()
+    #assert q.size() == k.size()
 
     def apply_semantic_attn(nth_head):
         # Computes semantic_attention by nth_head=0, 1, 2, ...
@@ -389,13 +392,13 @@ def merge_attn(positional_encoder,
         w = torch.concat([apply_semantic_attn(nth_head) for nth_head in range(q.size(1))], dim=1) # / 100.0  # [batch_size, nheads, seq_len, seq_len]
     else:
         # Attention by Time.
-        w  = time_attention(positional_encoder, salt_embedding, q, k)
+        w  = time_attention(positional_encoder, salt_embedding, q, k, is_top=is_top)
         
     # avoid unexcepted broadcasting
-    return nn.Softmax(dim=-1)(w / math.sqrt(w.size(-1)))
+    return nn.Softmax(dim=-1)(w)
 
 class SaltMHA(nn.Module):
-    def __init__(self, salt_embedding, config, attn_type="semantic"):
+    def __init__(self, salt_embedding, config, is_top, attn_type="semantic"):
         super(SaltMHA, self).__init__()
 
         # SaltMHA has a two state of MHA:
@@ -407,6 +410,8 @@ class SaltMHA(nn.Module):
         self.state = attn_type
         
         self.salt_embedding = salt_embedding
+
+        self.is_top = is_top
 
         self.config        = config
         self.embedding_dim = config.embedding_dim
@@ -429,11 +434,9 @@ class SaltMHA(nn.Module):
         self.W_q = nn.Parameter(torch.randn([1, config.nheads, size, size]) * math.sqrt(2 / size + size))
         self.W_v = nn.Parameter(torch.randn([1, config.nheads, size, size]) * math.sqrt(2 / size + size))
 
-        self.W_o = nn.Parameter(torch.randn([1, config.nheads, size, size]) * math.sqrt(2 / size + size))
+        self.W_o = nn.Linear(config.embedding_dim, config.embedding_dim)
         
-        self.dropoutq = nn.Dropout(config.dropout)
-        self.dropoutk = nn.Dropout(config.dropout)
-        self.dropoutv = nn.Dropout(config.dropout)
+        self.dropoutw = nn.Dropout(config.dropout)
 
         
     def split_heads(self, x):
@@ -456,25 +459,19 @@ class SaltMHA(nn.Module):
         """
         # TODO: Q, K, V
         
-        q = self.split_heads(source)        
-        k = self.split_heads(target)    
+        q = self.split_heads(source)
+        k = self.split_heads(target)
         v = self.split_heads(target)
-
         
         q = torch.matmul(q, self.W_q)
         if self.state == "semantic":
             k = torch.matmul(k, self.W_k)
         v = torch.matmul(v, self.W_v)
         
-        q, k, v = self.dropoutq(q), self.dropoutk(k), self.dropoutv(v)
-
-        w = merge_attn(self.encoder, self.salt_embedding, q, k, self.state)
+        w = self.dropoutw(merge_attn(self.encoder, self.salt_embedding, q, k, self.state, is_top=self.is_top)) #[batch_size, nheads, time_q, time_k]
         
         out = torch.matmul(w, v) # w <- word[0] * weight[0] + word[1] * weight[1] * ...
-
-        out = torch.matmul(out, self.W_o)
-        # Out Lienar?
-        return self.merge_heads(out)
+        return self.W_o(self.merge_heads(out))
 
 #Ref: https://github.com/graykode/gpt-2-Pytorch/blob/master/GPT2/model.py
 def gelu(x):
@@ -507,10 +504,10 @@ class FFN(nn.Module):
         return self.linear2(nn.functional.relu(self.linear1(x)))
     
 class Block(nn.Module):
-    def __init__(self, embedding_layer, config):
+    def __init__(self, embedding_layer, config, is_top):
         super(Block, self).__init__()
-        self.rnn = SaltMHA(embedding_layer, config, attn_type="grammar")
-        self.mha = SaltMHA(embedding_layer, config, attn_type="semantic")
+        self.rnn = SaltMHA(embedding_layer, config, is_top, attn_type="grammar")
+        self.mha = SaltMHA(embedding_layer, config, is_top, attn_type="semantic")
         
         self.ln1 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
         self.ln2 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
@@ -528,25 +525,25 @@ class Block(nn.Module):
     def forward(self, x, y):
         
         # Convection Step
-        y = y + (1/3) * self.dropout1(self.ffn1(self.ln1(y)))
+        y = y + (1/2) * self.dropout1(self.ffn1(self.ln1(y)))
 
         # Diffusion Step
         y_attn = self.rnn(x, y)
-
+        
         # Convection Step
-        y = y + (1/3) * self.dropout2(self.ffn2(self.ln2(y_attn + y)))
+        y = y + (1/2) * self.dropout2(self.ffn2(self.ln2(y_attn + y)))
 
         # Diffusion Step
         y_attn = self.mha(x, y)
         
-        y = y + (1/3) * self.dropout3(self.ffn3(self.ln3(y_attn + y)))
+        y = y + (1/2) * self.dropout3(self.ffn3(self.ln3(y_attn + y)))
         return y
 
 class SaltGPT(nn.Module):
     def __init__(self, config):
         super(SaltGPT, self).__init__()
         self.embedding = SaltEmbedding(config)
-        self.layers = nn.ModuleList([Block(self.embedding, config) for i in range(config.nlayers)])
+        self.layers = nn.ModuleList([Block(self.embedding, config, i == 0) for i in range(config.nlayers)])
         self.linear_out = nn.Linear(config.embedding_dim, config.vocab_size)
 
     def forward(self, x, y, y_past=None, is_last=False):

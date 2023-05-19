@@ -36,7 +36,8 @@ config = SaltConfig(opt_forward=False,
                     opt_backward=False,
                     nlayers=3,
                     dim_ffn=1024,
-                    diffusion_step=1)
+                    diffusion_step=1,
+                    dropout=0.5)
 
 weights = torch.load('./gpt2-pytorch_model.bin', map_location='cpu' if not torch.cuda.is_available() else None)['wte.weight']
 config.use_embedding = weights
@@ -74,10 +75,10 @@ print(start.size())
 def train(config, model, optimizer, x, y, use_len):
     model.train()
     optimizer.zero_grad()
-    y_out = step_model(config, model, x, start)
+    y_out = step_model(config, model, x[:, :use_len], start[:, :use_len])
     loss = 0.0
     
-    for n in range(use_len):
+    for n in range(0, use_len):
         loss += criterion(y_out[:, n, :], y[:, n+1])
     loss.backward()
     print(f"loss: {loss / use_len}")
@@ -108,14 +109,14 @@ def generate_sentence(config, model, source, input_more="", sentence_len=50):
         y_decode = torch.argmax(y_out, dim=-1)
         print(bpe_tokenizer.decode(y_decode[0].tolist()))
 
-generate_sentence(config, model, "[BOS] Sapporo is")
+generate_sentence(config, model, "[BOS]Sapporo is")
 
 use_len = 3
 
 for i in tqdm(range(1000)):
     loss_result = train(config, model, optimizer, x, y, use_len)
 
-    if loss_result <= 3.0:
+    if loss_result <= 5.0:
         use_len += 3
 
 
