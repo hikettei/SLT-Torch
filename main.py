@@ -71,20 +71,19 @@ print(x.size())
 print(y.size())
 print(start.size())
 
-def train(config, model, optimizer, x, y):
+def train(config, model, optimizer, x, y, use_len):
     model.train()
     optimizer.zero_grad()
     y_out = step_model(config, model, x, start)
     loss = 0.0
-
-    use_len = 5
     
-    for n in range(use_len):#range(y.size(1)-1):
+    for n in range(use_len):
         loss += criterion(y_out[:, n, :], y[:, n+1])
     loss.backward()
     print(f"loss: {loss / use_len}")
     optimizer.step()
-    generate_sentence(config, model, "[BOS]Sapporo is a city")
+    generate_sentence(config, model, "[BOS]Sapporo is")
+    return loss.item() / use_len
 
 def generate_sentence(config, model, source, input_more="", sentence_len=50):
     x_first = source
@@ -109,11 +108,17 @@ def generate_sentence(config, model, source, input_more="", sentence_len=50):
         y_decode = torch.argmax(y_out, dim=-1)
         print(bpe_tokenizer.decode(y_decode[0].tolist()))
 
-generate_sentence(config, model, "[BOS] Sapporo is a city")
+generate_sentence(config, model, "[BOS] Sapporo is")
     
 
+use_len = 5
+
 for i in tqdm(range(1000)):
-    train(config, model, optimizer, x, y)
+    loss_result = train(config, model, optimizer, x, y, use_len)
+
+    if loss_result <= 3.0:
+        use_len += 5
+
 
 while True:
     source = input("> Input Something...")
