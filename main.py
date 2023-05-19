@@ -81,7 +81,7 @@ def train(config, model, optimizer, x, y, use_len):
     for n in range(0, use_len):
         loss += criterion(y_out[:, n, :], y[:, n+1])
     loss.backward()
-    print(f"loss: {loss / use_len}")
+    print(f"loss: {loss / use_len} use_len: {use_len}")
     optimizer.step()
     generate_sentence(config, model, "[BOS]Sapporo is")
     return loss.item() / use_len

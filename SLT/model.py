@@ -347,7 +347,7 @@ def time_attention(positional_encoder, salt_embedding, q, k, is_top=False, decay
             w_ret.append(out)
 
             if not is_top:
-                next_word = nn.ReLU()(torch.mul(next_word, kn[:, t, :].unsqueeze(1)))
+                next_word = nn.Tanh()(torch.add(next_word, kn[:, t, :].unsqueeze(1)))
 
             #print(np.matmul(kn[:, t, :].detach().numpy(), cumulative_context.detach().numpy().transpose(-2, -1)))
             
