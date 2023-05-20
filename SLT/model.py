@@ -328,15 +328,15 @@ def time_attention(positional_encoder, salt_embedding, q, k, is_top=False, decay
         
         w_ret = [] # [[batch_size, time, 1] * time]
 
-        next_word, hidden_state = pe_w(kn[:, 0, :].unsqueeze(1))
-        
-        if not is_top and kn.size(1) != 1:
-            next_word = kn[:, 1, :].unsqueeze(1)
+        next_word, hidden_state = pe_w(qn[:, 0, :].unsqueeze(1))
+
+        for i in range(1, qn.size(1)):
+            next_word, hidden_state = pe_w(qn[:, i, :].unsqueeze(1), hidden_state)
 
         # [batch_size, whole_time, dim] @ [batch_size, 1, dim].T
         out = torch.matmul(qn, next_word.transpose(-2, -1))
         w_ret.append(out)
-
+        
         for t in range(1, whole_time):
             # Here, we predict Words t=n+1 from t=n and compute matmul.
             # [batch_size, time, embedding_dim//nheads] @ [batch_size, 1, embedding_dim//nheads].T
@@ -350,8 +350,7 @@ def time_attention(positional_encoder, salt_embedding, q, k, is_top=False, decay
             w_ret.append(out)
             
             if not is_top:
-                next_word = kn[:, t, :].unsqueeze(1) #nn.Tanh()(torch.add(next_word, kn[:, t, :].unsqueeze(1)))
-            
+                next_word = nn.Tanh()(torch.mul(next_word, kn[:, t, :].unsqueeze(1)))
             
         return torch.concat(w_ret, dim=-1).unsqueeze(dim=1) / math.sqrt(q.size(-1))
     
@@ -502,8 +501,8 @@ class FFN(nn.Module):
         self.linear2 = nn.Linear(d_ff, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear2(nn.functional.relu(self.linear1(x)))
-    
+        return self.linear2(gelu(self.linear1(x)))
+
 class Block(nn.Module):
     def __init__(self, embedding_layer, config, layer_n):
         super(Block, self).__init__()
@@ -513,39 +512,43 @@ class Block(nn.Module):
         self.ln1 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
         self.ln2 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
         self.ln3 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
+        self.ln4 = LayerNorm(config.embedding_dim, eps=config.layer_norm_eps)
         
         self.ffn1 = FFN(config.embedding_dim, config.dim_ffn)
         self.ffn2 = FFN(config.embedding_dim, config.dim_ffn)
         self.ffn3 = FFN(config.embedding_dim, config.dim_ffn)
+        self.ffn4 = FFN(config.embedding_dim, config.dim_ffn)
         
 
         self.dropout1 = nn.Dropout(config.dropout)
         self.dropout2 = nn.Dropout(config.dropout)
         self.dropout3 = nn.Dropout(config.dropout)
+        self.dropout4 = nn.Dropout(config.dropout)
 
-        self.alpha = nn.Parameter(torch.tensor(1.0))
-        self.beta  = nn.Parameter(torch.tensor(1.0))
-        self.gamma = nn.Parameter(torch.tensor(1.0))
+        self.p = 0.5
 
         self.layer_n = layer_n
         
     def forward(self, x, y):
-        print(f"== Layer {self.layer_n} ================================")
-        print(f"{self.alpha.item()} -> {self.beta.item()} -> {self.gamma.item()}")
         
         # Convection Step
-        y = y + self.alpha * self.dropout1(self.ffn1(self.ln1(y)))
+        y = y + self.p * self.dropout1(self.ffn1(self.ln1(y)))
 
         # Diffusion Step
         y_attn = self.rnn(x, y)
         
         # Convection Step
-        y = y + self.beta * self.dropout2(self.ffn2(self.ln2(y_attn + y)))
+        y = y + self.p * self.dropout2(self.ffn2(self.ln2(y_attn + y)))
+
+        # Convection Step
+
+        y = y + self.p * self.dropout3(self.ffn3(self.ln3(y)))
 
         # Diffusion Step
         y_attn = self.mha(x, y)
         
-        y = y + self.gamma * self.dropout3(self.ffn3(self.ln3(y_attn + y)))
+        # Convection Step
+        y = y + self.p * self.dropout4(self.ffn4(self.ln4(y_attn + y)))
         return y
 
 class SaltGPT(nn.Module):
