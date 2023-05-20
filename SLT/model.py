@@ -299,64 +299,19 @@ def time_attention(positional_encoder, salt_embedding, q, k, is_top=False, decay
     positional_encoder [1, nheads, 1, embedding_dim//nheads]
     """
 
-    whole_time = k.size(2)
-
     def apply_time_attn(nth_head):
         qn = q[:, nth_head, :, :] # [batch_size, time, embedding_dim//nheads]
         kn = k[:, nth_head, :, :] # [batch_size, time, embedding_dim//nheads]
-        pe_w = positional_encoder[nth_head] # RNN
+        pe_w1 = positional_encoder[nth_head][0]
+        pe_w2 = positional_encoder[nth_head][1]
 
-        # Compare QN [batch_size, whole_time, dim] vs [batch_size, t=0, dim], [batch_size, t=1, dim] ...
+        hidden_state = torch.zeros(1, qn.size(0), qn.size(-1), device=device)
+        _, hidden_state = pe_w1(qn, hidden_state)
+        out, _ = pe_w2(kn, hidden_state)
+        out = (torch.matmul(qn, out.transpose(-2, -1)) / math.sqrt(q.size(-1))).unsqueeze(1)
+        return out
 
-        # t=0
-        #        Source             Target
-        #  I have a new pen ... vs    So.
-        #  I have a new pen ... vs  So, So[t+1], So[t+2], So[t+3], ...
-        #
-        # t=1
-        #  I have a new pen ... vs  So, Do, Do[t+1], Do[t+2],      ... 
-        # t=2
-        #  I have a new pen ... vs  So, Do, I, I[t+1], I[t+2],     ...
-        #
-        # t=0~t=current_processing_time = accumlated in cumulative_context. and being reused.
-        # Todo: Mask Target When Training.
-        # Todo: When Inferencing, Salt doesn't have to wait until the t+1 word predicted.
-        # So looping Salt until the result gets enough good.
-        # The total result is normalized
-
-        # should cumulative_context be trainable? (k.weight works as initial-weight i guess)
-        
-        w_ret = [] # [[batch_size, time, 1] * time]
-
-        next_word, hidden_state = pe_w(qn[:, 0, :].unsqueeze(1))
-
-        for i in range(1, qn.size(1)):
-            next_word, hidden_state = pe_w(qn[:, i, :].unsqueeze(1), hidden_state)
-
-        # [batch_size, whole_time, dim] @ [batch_size, 1, dim].T
-        out = torch.matmul(qn, next_word.transpose(-2, -1))
-        w_ret.append(out)
-        
-        for t in range(1, whole_time):
-            # Here, we predict Words t=n+1 from t=n and compute matmul.
-            # [batch_size, time, embedding_dim//nheads] @ [batch_size, 1, embedding_dim//nheads].T
-
-            # get cumulative_context[t+1]
-            next_word, hidden_state = pe_w(next_word, hidden_state)
-            # cumulative_context = nn.Dropout()
-            # qn [batch_size, time, dim] @ cumulative_context[batch_size, hidden_dim, dim]
-            
-            out = torch.matmul(qn, next_word.transpose(-2, -1))
-            w_ret.append(out)
-            
-            if not is_top:
-                next_word = nn.Tanh()(torch.mul(next_word, kn[:, t, :].unsqueeze(1)))
-            
-        return torch.concat(w_ret, dim=-1).unsqueeze(dim=1) / math.sqrt(q.size(-1))
-    
     time_weights = torch.concat([apply_time_attn(nth) for nth in range(q.size(1))], dim=1)
-    
-    # Return: [batch_size, nheads, time_q, time_k]
     return time_weights
 
 def merge_attn(positional_encoder,
@@ -424,7 +379,7 @@ class SaltMHA(nn.Module):
             if config.positional_encoder == "orthogonal":
                 size = config.embedding_dim // config.nheads
                 self.encoder = nn.ModuleList([
-                    nn.GRU(size, size, batch_first=True) for i in range(config.nheads)
+                    nn.ModuleList([nn.GRU(size, size, batch_first=True), nn.GRU(size, size, batch_first=True)]) for i in range(config.nheads)
                 ])
             else:
                 raise Exception("Choose config.positional_encoder from: orthogonal")
